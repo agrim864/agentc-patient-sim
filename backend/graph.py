@@ -16,10 +16,10 @@ load_dotenv()
 # Logger for graph / LLM layer
 logger = logging.getLogger("agentc_graph")
 
-# Use 2.0 Flash as requested
+# Gemini 2.0 Flash
 gemini_llm = ChatGoogleGenerativeAI(
     model="gemini-2.0-flash",
-    temperature=0.3,  # Lower temp for more "tactical" precision
+    temperature=0.3,
     max_tokens=None,
     max_retries=2,
 )
@@ -33,12 +33,15 @@ class PatientState(TypedDict, total=False):
     done: bool
     final_diagnosis: str
     final_feedback: str
-    # New metrics passed from app.py logic to graph
+    # Updated metrics
     hints_used: int
-    # Scores returned by LLM
     score_accuracy: int
     score_thoroughness: int
     score_efficiency: int
+    diagnosis_correct: bool
+    treatment_hits: int
+    objectives: List[Dict[str, Any]]
+    reveals_used: int
 
 
 # ---------------- Helpers ----------------
@@ -66,8 +69,17 @@ def _get_last_doctor_message(messages: List[BaseMessage]) -> str:
 def _is_treatment_attempt(text: str, case: Dict[str, Any]) -> bool:
     t = text.lower()
     keywords = [
-        "diagnosis", "diagnose", "impression", "i suspect",
-        "treatment", "plan", "prescribe", "recommend", "start you on",
+        "diagnosis",
+        "diagnose",
+        "impression",
+        "i suspect",
+        "treatment",
+        "plan",
+        "prescribe",
+        "recommend",
+        "start you on",
+        "we will give",
+        "we will start",
     ]
     if any(k in t for k in keywords):
         return True
@@ -91,13 +103,13 @@ def _cleanup_json(text: str) -> str:
 def _safe_llm_invoke(prompt: str, context: str) -> str:
     try:
         resp = gemini_llm.invoke([("human", prompt)])
+        # Different langchain versions expose text slightly differently
         if hasattr(resp, "text") and resp.text:
             return resp.text
         if isinstance(resp.content, str):
             return resp.content
         return str(resp.content)
     except Exception as e:
-        # Log error with context but not full prompt (to avoid logging conversation content)
         logger.error(
             "LLM error in context=%s: %r",
             context,
@@ -114,7 +126,7 @@ def agent_node(state: PatientState) -> PatientState:
     new_state: PatientState = dict(state)
     messages: List[BaseMessage] = list(state.get("messages", []))
     case: Dict[str, Any] = dict(state.get("case", {}))
-    hints_count = state.get("hints_used", 0)
+    hints_count = int(state.get("hints_used", 0))
 
     if not messages or not case:
         new_state["messages"] = messages
@@ -125,13 +137,12 @@ def agent_node(state: PatientState) -> PatientState:
     stages = case.get("stages", []) or []
     max_stage = max(len(stages) - 1, 0)
 
-    # ---------- 1) Command AI Evaluator ----------
+    # ---------- 1) Command AI Evaluator (plan evaluation) ----------
     if _is_treatment_attempt(last_doctor_text, case):
         conv_text = _format_conversation(
             [m for m in messages if isinstance(m, (HumanMessage, AIMessage))]
         )
 
-        # Calculate current turn count
         turn_count = len([m for m in messages if isinstance(m, HumanMessage)])
 
         system_text = f"""
@@ -144,16 +155,30 @@ CASE FILE:
 - Hints Used: {hints_count}
 - Turns Taken: {turn_count}
 
+ACCEPTANCE RULES:
+- accepted = true ONLY IF:
+  * The operator's diagnosis clearly matches the true pathology (or a close synonym), AND
+  * They propose at least 2 appropriate treatment / management steps that match the required protocols.
+- If diagnosis or treatment is incomplete or unsafe, set accepted = false.
+
 SCORING ALGORITHM (0-100):
-1. ACCURACY: Is the diagnosis correct and the treatment safe? (0=Wrong/Dangerous, 100=Standard of Care)
-2. THOROUGHNESS: Did they ask relevant questions to rule out differentials? (0=Rushed/Guessing, 100=Comprehensive). If they spammed nonsense before solving, score this LOW (<50).
-3. EFFICIENCY: Base 100. DEDUCT 25 pts per HINT. DEDUCT 10 pts per TURN over 6.
+1. ACCURACY:
+   - 0  = Dangerous / wrong plan.
+   - 50 = Partially correct but missing key steps.
+   - 100 = Diagnosis + plan fully in line with standard of care.
+2. THOROUGHNESS:
+   - High if they asked relevant questions and ruled out key differentials.
+   - Lower if they jumped to a guess or asked many irrelevant questions.
+3. EFFICIENCY:
+   - Start at 100.
+   - Deduct 25 points for each hint.
+   - Deduct 10 points for each TURN over 6.
 
 TASK:
-1. Analyze the Operator's latest transmission.
-2. Determine if the plan is acceptable.
-3. Generate a simulated patient response.
-4. Calculate the 3 scores.
+1. Analyze the Operator's latest transmission and the whole transcript.
+2. Decide if the plan is acceptable based on the rules above.
+3. Generate a NATURAL patient response.
+4. Output honest tactical feedback and scores.
 
 OUTPUT FORMAT (Strict JSON):
 {{
@@ -165,8 +190,8 @@ OUTPUT FORMAT (Strict JSON):
   "score_efficiency": 0-100
 }}
 """
-        prompt = f"{system_text}\n\nTRANSCRIPT LOG:\n{conv_text}\n\nOUTPUT JSON:"
 
+        prompt = f"{system_text}\n\nTRANSCRIPT LOG:\n{conv_text}\n\nOUTPUT JSON:"
         raw_text = _safe_llm_invoke(prompt, context="evaluator")
         cleaned = _cleanup_json(raw_text)
 
@@ -179,7 +204,7 @@ OUTPUT FORMAT (Strict JSON):
             )
             data = {
                 "accepted": False,
-                "patient_reply": "I'm not sure I understand that plan, Doctor. Can you explain?",
+                "patient_reply": "I'm not sure I understand that plan, Doctor. Can you explain it briefly?",
                 "short_feedback": "PROTOCOL ERROR: Plan unclear or unparsed.",
                 "score_accuracy": 0,
                 "score_thoroughness": 0,
@@ -198,10 +223,10 @@ OUTPUT FORMAT (Strict JSON):
             new_state["done"] = True
             new_state["final_diagnosis"] = case.get("expected_diagnosis", "")
             new_state["final_feedback"] = short_feedback
-            # Save scores
             new_state["score_accuracy"] = int(data.get("score_accuracy", 70))
             new_state["score_thoroughness"] = int(data.get("score_thoroughness", 70))
             new_state["score_efficiency"] = int(data.get("score_efficiency", 70))
+            new_state["diagnosis_correct"] = True
 
             logger.info(
                 "Evaluator accepted plan: case_id=%s scores=(acc:%d,th:%d,eff:%d)",
@@ -211,11 +236,9 @@ OUTPUT FORMAT (Strict JSON):
                 new_state["score_efficiency"],
             )
 
-            # Append a system message to close the loop in UI
             messages.append(
                 AIMessage(content="/// COMMAND AI: PROTOCOLS ACCEPTED. CASE CLOSED. ///")
             )
-
         else:
             logger.info(
                 "Evaluator rejected plan: case_id=%s (scores acc:%s th:%s eff:%s)",
@@ -229,8 +252,6 @@ OUTPUT FORMAT (Strict JSON):
 
     # ---------- 2) Patient Simulation Branch ----------
     stage = max(0, min(stage, max_stage))
-
-    # Reveal symptoms based on current stage
     visible_symptoms = stages[: stage + 1]
 
     conv_text = _format_conversation(
@@ -251,9 +272,11 @@ CURRENT SYMPTOM DATA (Reveal ONLY this to the Doctor):
 
 DIRECTIVES:
 - You are a human patient. Do NOT mention you are an AI or simulation.
-- React naturally to the Doctor's questions.
+- Answer the DOCTOR's specific question directly first, then add 1–2 relevant details.
 - If asked about symptoms NOT in your Current Data, say you haven't noticed that.
-- Keep responses concise (1-3 sentences).
+- Keep responses concise (1–3 sentences).
+- Avoid repeating the exact same line more than once. If you already said you don't understand the plan, don't repeat that again.
+- If the doctor has already clearly explained the plan and you seem to understand it, acknowledge once (e.g., "Okay, I understand") and then stop asking for clarification about the same plan.
 """
 
     prompt = f"{system_text}\n\nTRANSCRIPT LOG:\n{conv_text}\n\nPATIENT RESPONSE:"

@@ -1,3 +1,4 @@
+// frontend/src/App.jsx
 import React, { useEffect, useState } from "react";
 import {
   getSpecialties,
@@ -6,15 +7,82 @@ import {
   sendChat,
   requestHint,
   getSummary,
+  revealObjective,
+  getProgress as apiGetProgress,
+  resetProgress as apiResetProgress,
 } from "./api";
 import { API_BASE } from "./config";
 
-// --- Utility Functions ---
+// --- Rank System ---
+// 0–9★ : STUDENT
+// 10–19★ : INTERN
+// 20–29★ : RESIDENT
+// 30–39★ : FELLOW
+// 40–49★ : ATTENDING
+// 50–59★ : CHIEF
+// 60–69★ : LEGEND
+// 70–75★ : HIPPOCRATES
+const RANK_TIERS = [
+  { name: "STUDENT", minStars: 0 },
+  { name: "INTERN", minStars: 10 },
+  { name: "RESIDENT", minStars: 20 },
+  { name: "FELLOW", minStars: 30 },
+  { name: "ATTENDING", minStars: 40 },
+  { name: "CHIEF", minStars: 50 },
+  { name: "LEGEND", minStars: 60 },
+  { name: "HIPPOCRATES", minStars: 70 },
+];
+
+const MAX_REVEALS_PER_LEVEL = 3;
+const TOTAL_LEVELS = 25;
+const GLOBAL_MAX_STARS = TOTAL_LEVELS * 3;
+
+function getRankInfo(totalStarsRaw) {
+  const stars = Math.max(0, totalStarsRaw || 0);
+
+  // pick highest tier whose minStars <= stars
+  let currentIndex = 0;
+  for (let i = 0; i < RANK_TIERS.length; i++) {
+    if (stars >= RANK_TIERS[i].minStars) {
+      currentIndex = i;
+    } else {
+      break;
+    }
+  }
+
+  const current = RANK_TIERS[currentIndex];
+  const next = RANK_TIERS[currentIndex + 1] || null;
+
+  const currentFloor = current.minStars;
+  const nextFloor = next ? next.minStars : GLOBAL_MAX_STARS;
+
+  let progressFraction = 0;
+  if (!next) {
+    const spanToMax = Math.max(1, GLOBAL_MAX_STARS - currentFloor);
+    progressFraction = Math.min(1, (stars - currentFloor) / spanToMax);
+  } else {
+    const span = Math.max(1, nextFloor - currentFloor);
+    progressFraction = Math.min(1, (stars - currentFloor) / span);
+  }
+
+  const progressPercent = Math.round(progressFraction * 100);
+
+  return {
+    name: current.name,
+    currentFloor,
+    nextName: next ? next.name : null,
+    nextFloor,
+    progressPercent,
+  };
+}
+
+// --- Utility Functions for global progress ---
+// (These just wrap the API helpers; kept here for clarity)
 
 async function fetchGlobalProgress() {
   try {
-    const res = await fetch(`${API_BASE}/api/progress`);
-    return await res.json();
+    const data = await apiGetProgress();
+    return data;
   } catch (e) {
     console.error("Failed to fetch progress", e);
     return { progress: {} };
@@ -23,21 +91,12 @@ async function fetchGlobalProgress() {
 
 async function resetGlobalProgress() {
   try {
-    const res = await fetch(`${API_BASE}/api/reset`, { method: "POST" });
-    return await res.json();
+    const data = await apiResetProgress();
+    return data;
   } catch (e) {
     console.error("Failed to reset progress", e);
     return { progress: {} };
   }
-}
-
-function getRankFromLevel(level) {
-  if (!level) return "CADET";
-  if (level <= 1) return "INTERN";
-  if (level === 2) return "OFFICER";
-  if (level === 3) return "COMMANDER";
-  if (level === 4) return "CAPTAIN";
-  return "ADMIRAL";
 }
 
 // --- Main Component ---
@@ -55,6 +114,7 @@ function App() {
 
   const [loading, setLoading] = useState(false);
   const [hintLoading, setHintLoading] = useState(false);
+  const [revealLoading, setRevealLoading] = useState(false);
   const [summaryLoading, setSummaryLoading] = useState(false);
 
   const [hint, setHint] = useState("");
@@ -63,6 +123,11 @@ function App() {
 
   const [progress, setProgress] = useState({});
   const [theme, setTheme] = useState("dark");
+
+  // per-level usage
+  const [hintsUsed, setHintsUsed] = useState(0);
+  const [objectives, setObjectives] = useState([]);
+  const [revealsUsed, setRevealsUsed] = useState(0);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -81,6 +146,7 @@ function App() {
           setProgress(progData.progress);
         }
       } catch (err) {
+        console.error(err);
         setError("SYSTEM FAILURE: CONNECTION REFUSED");
       }
     }
@@ -95,27 +161,39 @@ function App() {
   async function handleResetData() {
     if (!window.confirm("WARNING: CLEARING ALL CAMPAIGN DATA. CONFIRM?")) return;
     try {
-      await resetGlobalProgress();
-      setProgress({});
+      const data = await resetGlobalProgress();
+      setProgress(data.progress || {});
     } catch (err) {
+      console.error(err);
       setError("RESET FAILED");
     }
   }
 
   async function handleSpecialtyClick(spec) {
-    setSelectedSpecialty(spec);
-    setSelectedLevel(null);
-    setError("");
-    setLevels([]);
-    setStep("level");
+  setSelectedSpecialty(spec);
+  setSelectedLevel(null);
+  setError("");
+  setLevels([]);
+  setHint("");
+  setSummaryState(null);
+  setMessages([]);
+  setSession(null);
+  setHintsUsed(0);
+  setObjectives([]);
+  setRevealsUsed(0);
 
-    try {
-      const data = await getLevels(spec);
-      setLevels(data);
-    } catch (err) {
-      setError("SYSTEM FAILURE: SECTOR LOCKED");
-    }
+  // THIS LINE WAS MISSING
+  setStep("level");
+
+  try {
+    const data = await getLevels(spec);
+    setLevels(data);
+  } catch (err) {
+    console.error(err);
+    setError("SYSTEM FAILURE: SECTOR LOCKED");
   }
+}
+
 
   async function handleLevelClick(level) {
     setSelectedLevel(level);
@@ -123,6 +201,9 @@ function App() {
     setHint("");
     setSummaryState(null);
     setMessages([]);
+    setHintsUsed(0);
+    setObjectives([]);
+    setRevealsUsed(0);
     setLoading(true);
 
     try {
@@ -130,8 +211,10 @@ function App() {
         specialty: selectedSpecialty,
         level,
       });
+
       setSession(data);
       setStep("chat");
+      setObjectives(data.objectives || []);
 
       const introMsg = {
         role: "system",
@@ -139,6 +222,7 @@ function App() {
       };
       setMessages([introMsg]);
     } catch (err) {
+      console.error(err);
       setError("CONNECTION ERROR: RETRY");
     } finally {
       setLoading(false);
@@ -167,31 +251,82 @@ function App() {
         { role: "assistant", content: data.reply },
       ]);
 
+      if (Array.isArray(data.objectives)) {
+        setObjectives(data.objectives);
+      }
+
       if (data.done || data.accepted_treatment !== undefined) {
         setSession((prev) =>
           prev
-            ? { ...prev, done: data.done, accepted_treatment: data.accepted_treatment }
+            ? {
+                ...prev,
+                done: data.done,
+                accepted_treatment: data.accepted_treatment,
+              }
             : prev
         );
       }
     } catch (err) {
+      console.error(err);
       setError("TRANSMISSION FAILED");
     } finally {
       setLoading(false);
     }
   }
 
+  // Hints: textual intel (efficiency penalty, not star spend)
   async function handleHint() {
     if (!session || hintLoading) return;
+
     setError("");
     setHintLoading(true);
     try {
       const data = await requestHint({ sessionId: session.session_id });
-      setHint(`[INTEL RECEIVED] Hint ${data.hint_index}/${data.total_hints}: ${data.hint}`);
+      setHint(
+        `[INTEL RECEIVED] Hint ${data.hint_index}/${data.total_hints}: ${data.hint}`
+      );
+      setHintsUsed((prev) => prev + 1);
     } catch (err) {
+      console.error(err);
       setError("INTEL UNAVAILABLE");
     } finally {
       setHintLoading(false);
+    }
+  }
+
+  // Reveal: flips one hidden objective visible (and marks achieved) at cost of 1 star
+  async function handleReveal() {
+    if (!session || revealLoading) return;
+
+    const hasHidden = (objectives || []).some((o) => !o.visible);
+    if (!hasHidden) {
+      setError("NO HIDDEN OBJECTIVES LEFT TO REVEAL");
+      return;
+    }
+
+    if (revealsUsed >= MAX_REVEALS_PER_LEVEL) {
+      setError("NO STARS LEFT TO SPEND ON REVEALS");
+      return;
+    }
+
+    setError("");
+    setRevealLoading(true);
+    try {
+      const data = await revealObjective({ sessionId: session.session_id });
+      if (Array.isArray(data.objectives)) {
+        setObjectives(data.objectives);
+      }
+      setRevealsUsed(
+        typeof data.reveals_used === "number"
+          ? data.reveals_used
+          : revealsUsed + 1
+      );
+      setHint(`[OBJECTIVE REVEALED] ${data.message}`);
+    } catch (err) {
+      console.error(err);
+      setError("REVEAL FAILED");
+    } finally {
+      setRevealLoading(false);
     }
   }
 
@@ -222,7 +357,13 @@ function App() {
       if (progData.progress) {
         setProgress((prev) => ({ ...prev, ...progData.progress }));
       }
+
+      // Sync revealsUsed from backend summary if available
+      if (typeof data.reveals_used === "number") {
+        setRevealsUsed(data.reveals_used);
+      }
     } catch (err) {
+      console.error(err);
       setError("DEBRIEF FAILED");
     } finally {
       setSummaryLoading(false);
@@ -237,6 +378,9 @@ function App() {
     setMessages([]);
     setHint("");
     setSummaryState(null);
+    setHintsUsed(0);
+    setObjectives([]);
+    setRevealsUsed(0);
     setError("");
   }
 
@@ -246,6 +390,9 @@ function App() {
     setMessages([]);
     setHint("");
     setSummaryState(null);
+    setHintsUsed(0);
+    setObjectives([]);
+    setRevealsUsed(0);
     setError("");
     setSelectedLevel(null);
     setSelectedSpecialty("");
@@ -261,15 +408,25 @@ function App() {
     setMessages([]);
     setHint("");
     setSummaryState(null);
+    setHintsUsed(0);
+    setObjectives([]);
+    setRevealsUsed(0);
     setError("");
     setSelectedLevel(null);
   }
 
-  const rank = session && session.level ? getRankFromLevel(session.level) : "CADET";
-
   const totalCompleted = Object.keys(progress).length;
-  const totalLevels = 25; 
-  const progressPercent = Math.round((totalCompleted / totalLevels) * 100);
+
+  const totalStars = Object.values(progress || {}).reduce(
+    (sum, v) => sum + (v || 0),
+    0
+  );
+  const rankInfo = getRankInfo(totalStars);
+
+  const starsLeftThisLevel = Math.max(
+    0,
+    MAX_REVEALS_PER_LEVEL - revealsUsed
+  );
 
   return (
     <div className="app-root">
@@ -280,19 +437,25 @@ function App() {
             <div className="app-logo-box">AG-C</div>
             <div>
               <div className="app-title">AGENT-C SIMULATOR</div>
-              <div className="app-subtitle">TACTICAL MEDICAL TRAINING INTERFACE</div>
+              <div className="app-subtitle">
+                TACTICAL MEDICAL TRAINING INTERFACE
+              </div>
             </div>
           </div>
           <div className="header-right">
             <button type="button" className="hud-btn small" onClick={toggleTheme}>
               {theme === "light" ? "☾ NIGHT" : "☀ DAY"}
             </button>
-            {rank && (
-              <div className="rank-display">
-                <span className="rank-label">CURRENT RANK</span>
-                <span className="rank-value">{rank}</span>
-              </div>
-            )}
+            <div className="rank-display">
+              <span className="rank-label">CURRENT RANK</span>
+              <span className="rank-value">{rankInfo.name}</span>
+              <span className="rank-stars">
+                {totalStars}★
+                {rankInfo.nextName
+                  ? ` → ${rankInfo.nextName} @ ${rankInfo.nextFloor}★`
+                  : " (MAX)"}
+              </span>
+            </div>
             {session && (
               <button className="hud-btn alert small" onClick={handleNewCase}>
                 ABORT / NEW
@@ -314,17 +477,33 @@ function App() {
             <div className="hud-card info-card campaign-panel">
               <div className="hud-card-header small">CAMPAIGN PROGRESS</div>
               <div className="status-row small">
-                <span className="label">COMPLETED</span>
+                <span className="label">RANK</span>
+                <span className="value">{rankInfo.name}</span>
+              </div>
+              <div className="status-row small">
+                <span className="label">STARS</span>
+                <span className="value">{totalStars}/{GLOBAL_MAX_STARS}</span>
+              </div>
+              <div className="status-row small">
+                <span className="label">MISSIONS CLEARED</span>
                 <span className="value">
-                  {totalCompleted}/{totalLevels}
+                  {totalCompleted}/{TOTAL_LEVELS}
                 </span>
               </div>
               <div className="xp-container">
                 <div className="xp-bar">
                   <div
                     className="xp-fill"
-                    style={{ width: `${progressPercent}%`, background: "var(--success)" }}
+                    style={{
+                      width: `${rankInfo.progressPercent}%`,
+                      background: "var(--success)",
+                    }}
                   ></div>
+                </div>
+                <div className="xp-label">
+                  {rankInfo.nextName
+                    ? `${totalStars} / ${rankInfo.nextFloor}★ to ${rankInfo.nextName}`
+                    : `${totalStars} / ${GLOBAL_MAX_STARS}★ (MAX RANK)`}
                 </div>
               </div>
               <div style={{ marginTop: "15px", textAlign: "center" }}>
@@ -365,11 +544,17 @@ function App() {
                   loading={loading}
                   hint={hint}
                   hintLoading={hintLoading}
+                  revealLoading={revealLoading}
                   summary={summary}
                   summaryLoading={summaryLoading}
+                  hintsUsed={hintsUsed}
+                  objectives={objectives}
+                  revealsUsed={revealsUsed}
+                  starsLeftThisLevel={starsLeftThisLevel}
                   onInputChange={setInput}
                   onSend={handleSend}
                   onHint={handleHint}
+                  onReveal={handleReveal}
                   onSummary={handleSummary}
                   onBackToSpecialty={handleBackToSpecialty}
                   onBackToLevel={handleBackToLevel}
@@ -393,7 +578,11 @@ function GameInfo({ step, session, selectedSpecialty, selectedLevel, summary }) 
           <div className="status-row">
             <span className="label">PHASE</span>
             <span className="value blink">
-              {step === "specialty" ? "SELECT SPEC" : step === "level" ? "SELECT DIFF" : "ACTIVE"}
+              {step === "specialty"
+                ? "SELECT SPEC"
+                : step === "level"
+                ? "SELECT DIFF"
+                : "ACTIVE"}
             </span>
           </div>
           {selectedSpecialty && (
@@ -534,15 +723,24 @@ function ChatScreen({
   loading,
   hint,
   hintLoading,
+  revealLoading,
   summary,
   summaryLoading,
+  hintsUsed,
+  objectives,
+  revealsUsed,
+  starsLeftThisLevel,
   onInputChange,
   onSend,
   onHint,
+  onReveal,
   onSummary,
   onBackToSpecialty,
   onBackToLevel,
 }) {
+  const missionComplete = !!summary;
+  const hasHiddenObjectives = (objectives || []).some((o) => !o.visible);
+
   return (
     <div className="chat-layout">
       <div className="hud-card chat-card">
@@ -565,15 +763,56 @@ function ChatScreen({
         </div>
 
         <div className="chat-objectives">
-          <span className="chip">1. CLARIFY</span>
-          <span className="chip">2. RISK FACTORS</span>
-          <span className="chip">3. DIAGNOSE</span>
-          <span className="chip">4. TREAT</span>
+          <div className="objectives-header">
+            <span>CASE OBJECTIVES</span>
+            <span className="objective-helper">
+              Reveals: {revealsUsed}/{MAX_REVEALS_PER_LEVEL} · Stars left:{" "}
+              {starsLeftThisLevel}
+            </span>
+          </div>
+          <div className="objective-pill-row">
+            {objectives && objectives.length > 0 ? (
+              objectives.map((obj) => {
+                let cls = "objective-pill";
+                if (!obj.visible) cls += " hidden";
+                if (obj.achieved) cls += " achieved";
+                if (obj.revealed_by_user) cls += " revealed";
+                return (
+                  <div key={obj.id} className={cls}>
+                    <span className="objective-type">
+                      {obj.type === "diagnosis" ? "DX" : "TX"}
+                    </span>
+                    <span className="objective-label">
+                      {obj.visible ? obj.label : "????"}
+                    </span>
+                  </div>
+                );
+              })
+            ) : (
+              <span className="objective-helper">
+                Objectives will light up as you discover them.
+              </span>
+            )}
+          </div>
+          <div className="objective-meta">
+            <span className="chip">
+              PLAN: clarify → risk factors → diagnose → treat
+            </span>
+          </div>
+        </div>
+
+        <div className="hint-meta-row">
+          <span>Hints used: {hintsUsed}</span>
+          <span>
+            Reveals: {revealsUsed}/{MAX_REVEALS_PER_LEVEL}
+          </span>
         </div>
 
         <div className="chat-window">
           <div className="chat-messages-container">
-            {messages.length === 0 && <div className="chat-empty">AWAITING INPUT...</div>}
+            {messages.length === 0 && (
+              <div className="chat-empty">AWAITING INPUT...</div>
+            )}
             {messages.map((m, idx) => (
               <MessageBubble key={idx} role={m.role} content={m.content} />
             ))}
@@ -589,16 +828,46 @@ function ChatScreen({
             value={input}
             onChange={(e) => onInputChange(e.target.value)}
           />
-          <button type="submit" className="hud-btn primary" disabled={loading || !input.trim()}>
+          <button
+            type="submit"
+            className="hud-btn primary"
+            disabled={loading || !input.trim()}
+          >
             TRANSMIT
           </button>
         </form>
 
         <div className="chat-actions">
-          <button className="hud-btn secondary" onClick={onHint} disabled={hintLoading}>
-            {hintLoading ? "DECRYPTING..." : "REQ. INTEL (HINT)"}
+          <button
+            className="hud-btn secondary"
+            onClick={onHint}
+            disabled={hintLoading || missionComplete}
+          >
+            {hintLoading ? "SCANNING..." : "INTEL HINT"}
           </button>
-          <button className="hud-btn alert" onClick={onSummary} disabled={summaryLoading}>
+          <button
+            className="hud-btn secondary"
+            onClick={onReveal}
+            disabled={
+              revealLoading ||
+              missionComplete ||
+              starsLeftThisLevel <= 0 ||
+              !hasHiddenObjectives
+            }
+          >
+            {revealLoading
+              ? "REVEALING..."
+              : starsLeftThisLevel <= 0
+              ? "NO STARS LEFT"
+              : !hasHiddenObjectives
+              ? "NO OBJECTIVES LEFT"
+              : "REVEAL OBJ (-1★)"}
+          </button>
+          <button
+            className="hud-btn alert"
+            onClick={onSummary}
+            disabled={summaryLoading}
+          >
             {summaryLoading ? "ANALYZING..." : "END MISSION"}
           </button>
         </div>
@@ -652,7 +921,11 @@ function MetricBar({ label, value, color }) {
       <div className="xp-bar" style={{ height: "4px", background: "#333" }}>
         <div
           className="xp-fill"
-          style={{ width: `${value}%`, background: color, boxShadow: `0 0 8px ${color}` }}
+          style={{
+            width: `${value}%`,
+            background: color,
+            boxShadow: `0 0 8px ${color}`,
+          }}
         ></div>
       </div>
     </div>
@@ -679,6 +952,17 @@ function SummaryPanel({ summary }) {
         <MetricBar label="ACCURACY" value={acc} color="var(--primary)" />
         <MetricBar label="INTEL/DATA" value={th} color="var(--secondary)" />
         <MetricBar label="SPEED/EFF" value={eff} color="var(--warning)" />
+      </div>
+
+      <div className="metrics-meta">
+        <div className="status-row small">
+          <span className="label">Hints used</span>
+          <span className="value">{summary.hints_used}</span>
+        </div>
+        <div className="status-row small">
+          <span className="label">Objectives revealed</span>
+          <span className="value">{summary.reveals_used}</span>
+        </div>
       </div>
 
       <div className="terminal-text">{summary.feedback}</div>

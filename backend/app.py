@@ -1,9 +1,12 @@
 # backend/app.py
-
 import os
 import uuid
 import logging
-from typing import Dict
+import re
+import difflib
+from typing import Dict, List, Any
+
+
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -14,8 +17,18 @@ from langchain_core.messages import HumanMessage, AIMessage
 from graph import graph_app, PatientState
 from patient_cases import pick_case, PATIENT_CASES
 from models import (
-    StartSessionRequest, StartSessionResponse, ChatRequest, ChatMessage,
-    ChatResponse, SummaryResponse, HintRequest, HintResponse, LogEntry
+    StartSessionRequest,
+    StartSessionResponse,
+    ChatRequest,
+    ChatMessage,
+    ChatResponse,
+    SummaryResponse,
+    HintRequest,
+    HintResponse,
+    LogEntry,
+    Objective,
+    RevealObjectiveRequest,
+    RevealObjectiveResponse,
 )
 
 # --------- LOGGING SETUP (MINIMAL, NON-SENSITIVE) ----------
@@ -29,7 +42,7 @@ app = Flask(__name__)
 CORS(app)
 
 # --- GLOBAL STORES ---
-# Key: "specialty|level", Value: int (stars)
+# Key: "specialty|level", Value: int (best stars earned)
 USER_PROGRESS: Dict[str, int] = {}
 
 SESSION_CASES: Dict[str, dict] = {}
@@ -37,10 +50,170 @@ SESSION_LOGS: Dict[str, LogEntry] = {}
 SESSION_STATES: Dict[str, PatientState] = {}
 
 
-# --- HELPERS ---
+# --- TEXT HELPERS ---
 
-def _messages_to_dto(messages):
-    dto = []
+def _normalize(text: str) -> str:
+    return re.sub(r"[^a-z0-9\s]", " ", (text or "").lower()).strip()
+
+
+def _contains_any(text: str, keywords: List[str]) -> bool:
+    t = _normalize(text)
+    if not keywords:
+        return False
+    return any(_normalize(kw) in t for kw in keywords if kw)
+
+
+
+
+
+def _normalize_session_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Support either sessionId or session_id coming from the frontend."""
+    if "sessionId" in data and "session_id" not in data:
+        data["session_id"] = data["sessionId"]
+    return data
+
+
+# --- OBJECTIVES HELPERS ---
+
+def _build_objectives_for_case(case: dict) -> List[Dict[str, Any]]:
+    """Build the hidden checklist: 1 diagnosis + key treatments."""
+    objectives: List[Dict[str, Any]] = []
+
+    expected_dx = (case.get("expected_diagnosis") or "").strip()
+    if expected_dx:
+        objectives.append({
+            "id": "diagnosis",
+            "label": expected_dx,
+            "type": "diagnosis",
+            "visible": False,
+            "achieved": False,
+            "revealed_by_user": False,
+            "keywords": [expected_dx],
+        })
+
+    tx_keywords = case.get("treatment_keywords") or case.get(
+        "expected_treatment_keywords", []
+    )
+    for idx, kw in enumerate(tx_keywords):
+        label = (kw or "").strip()
+        if not label:
+            continue
+        objectives.append({
+            "id": f"treatment_{idx}",
+            "label": label,
+            "type": "treatment",
+            "visible": False,
+            "achieved": False,
+            "revealed_by_user": False,
+            "keywords": [label],
+        })
+
+    return objectives
+
+
+def _fuzzy_token_match(a: str, b: str, threshold: float = 0.8) -> bool:
+    """
+    Return True if two tokens are 'close enough' to each other,
+    e.g. minor spelling mistakes: 'pnemonia' ~ 'pneumonia'.
+    """
+    a = (a or "").strip()
+    b = (b or "").strip()
+    if not a or not b:
+        return False
+    return difflib.SequenceMatcher(None, a, b).ratio() >= threshold
+
+
+def _phrase_hit(text: str, phrase: str, min_tokens: int = 1) -> bool:
+    """
+    Check if a phrase appears in the text, allowing for:
+    - small spelling mistakes
+    - token-level fuzzy matches
+
+    We consider the phrase 'hit' if at least `min_tokens`
+    of its tokens match some token in the text (exact or fuzzy).
+    """
+    t_tokens = _normalize(text).split()
+    p_tokens = [tok for tok in _normalize(phrase).split() if tok]
+
+    if not t_tokens or not p_tokens:
+        return False
+
+    hits = 0
+    for p in p_tokens:
+        for t in t_tokens:
+            if t == p or _fuzzy_token_match(t, p):
+                hits += 1
+                break
+
+    needed = min(len(p_tokens), max(1, min_tokens))
+    return hits >= needed
+
+
+def _token_overlap_match(
+    text: str, target_phrases: List[str], min_overlap: int = 1
+) -> bool:
+    """
+    Diagnosis helper: true if ANY target phrase 'matches' the text,
+    where match = enough token overlap, allowing spelling mistakes.
+    """
+    for phrase in target_phrases or []:
+        if not phrase:
+            continue
+        if _phrase_hit(text, phrase, min_tokens=min_overlap):
+            return True
+    return False
+
+
+def _count_keyword_hits(text: str, keywords: List[str]) -> int:
+    """
+    Treatment helper: count how many treatment phrases appear in the text,
+    allowing for minor spelling mistakes.
+    """
+    count = 0
+    for kw in keywords or []:
+        if not kw:
+            continue
+        if _phrase_hit(text, kw, min_tokens=1):
+            count += 1
+    return count
+
+
+def _update_objectives_from_message(state: Dict[str, Any], msg: str) -> None:
+    """
+    Mark hidden objectives as achieved when the user 'basically' says them,
+    even if they misspell a word or two.
+    """
+    objs = state.get("objectives") or []
+    for obj in objs:
+        if obj.get("achieved"):
+            continue
+        for kw in obj.get("keywords", []):
+            if kw and _phrase_hit(msg, kw, min_tokens=1):
+                obj["achieved"] = True
+                obj["visible"] = True
+                break
+    state["objectives"] = objs
+
+
+
+def _public_objectives(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Strip internal fields like 'keywords' before sending to frontend."""
+    objs = state.get("objectives") or []
+    clean: List[Dict[str, Any]] = []
+    for obj in objs:
+        clean.append({
+            "id": obj.get("id"),
+            "label": obj.get("label"),
+            "type": obj.get("type"),
+            "visible": bool(obj.get("visible", False)),
+            "achieved": bool(obj.get("achieved", False)),
+            "revealed_by_user": bool(obj.get("revealed_by_user", False)),
+        })
+    return clean
+
+
+def _messages_to_dto(messages: List[Any]) -> List[ChatMessage]:
+    dto: List[ChatMessage] = []
     for m in messages:
         if isinstance(m, HumanMessage):
             role = "user"
@@ -51,15 +224,6 @@ def _messages_to_dto(messages):
         dto.append(ChatMessage(role=role, content=m.content))
     return dto
 
-def _norm(text: str) -> str:
-    return (text or "").lower().strip()
-
-def _contains_any(text: str, keywords) -> bool:
-    t = _norm(text)
-    if not keywords:
-        return False
-    return any((kw or "").lower() in t for kw in keywords if kw)
-
 
 # --- ROUTES ---
 
@@ -68,7 +232,6 @@ def handle_error(e):
     code = 500
     if isinstance(e, HTTPException):
         code = e.code
-    # Log only type + message, not request body
     logger.exception("Unhandled exception occurred: %s", repr(e))
     return jsonify({"error": str(e)}), code
 
@@ -104,14 +267,12 @@ def levels():
 
 @app.route("/api/progress", methods=["GET"])
 def get_progress():
-    """Returns the best star rating for each completed level."""
     logger.debug("Progress requested; entries=%d", len(USER_PROGRESS))
     return jsonify({"progress": USER_PROGRESS})
 
 
 @app.route("/api/reset", methods=["POST"])
 def reset_progress():
-    """Wipes all user progress (Clear Data)."""
     USER_PROGRESS.clear()
     logger.info("User progress reset (all specialties/levels)")
     return jsonify({"status": "cleared", "progress": {}})
@@ -135,6 +296,8 @@ def start_session():
     if max_stage < 0:
         max_stage = 0
 
+    objectives = _build_objectives_for_case(case)
+
     initial_state: PatientState = {
         "messages": [],
         "case": case,
@@ -149,6 +312,8 @@ def start_session():
         "score_thoroughness": 0,
         "score_efficiency": 0,
         "hints_used": 0,
+        "objectives": objectives,
+        "reveals_used": 0,
     }
     SESSION_STATES[session_id] = initial_state
 
@@ -166,6 +331,9 @@ def start_session():
         score_accuracy=0,
         score_thoroughness=0,
         score_efficiency=0,
+        diagnosis_correct=False,
+        treatment_hits=0,
+        reveals_used=0,
     )
     SESSION_LOGS[session_id] = log
 
@@ -178,6 +346,8 @@ def start_session():
         case["difficulty"],
     )
 
+    public_objs = _public_objectives(initial_state)
+
     resp = StartSessionResponse(
         session_id=session_id,
         case_id=case["id"],
@@ -187,6 +357,7 @@ def start_session():
         patient_name=case["name"],
         chief_complaint=case["chief_complaint"],
         max_stage=max_stage,
+        objectives=[Objective(**o) for o in public_objs],
     )
     return jsonify(resp.model_dump())
 
@@ -194,6 +365,7 @@ def start_session():
 @app.route("/api/chat", methods=["POST"])
 def chat():
     data = request.get_json(force=True, silent=True) or {}
+    data = _normalize_session_payload(data)
     req = ChatRequest(**data)
 
     if req.session_id not in SESSION_CASES:
@@ -201,16 +373,16 @@ def chat():
         return jsonify({"error": "INVALID SESSION ID"}), 400
 
     case = SESSION_CASES[req.session_id]
-    prev_state = SESSION_STATES[req.session_id]
+    state = SESSION_STATES[req.session_id]
     log = SESSION_LOGS[req.session_id]
 
     log.turns += 1
     turn_number = log.turns
 
-    messages = list(prev_state.get("messages", []))
+    messages = list(state.get("messages", []))
     messages.append(HumanMessage(content=req.message))
-    prev_state["messages"] = messages
-    prev_state["hints_used"] = log.hints_used
+    state["messages"] = messages
+    state["hints_used"] = log.hints_used
 
     logger.info(
         "Chat turn: session_id=%s case_id=%s turn=%d",
@@ -219,11 +391,13 @@ def chat():
         turn_number,
     )
 
-    # Already done?
-    if prev_state.get("done"):
+    # Already done? Just echo a closing message.
+    if state.get("done"):
         closing = "/// MISSION STATUS: COMPLETE. Access 'End Mission' for debrief. ///"
         messages.append(AIMessage(content=closing))
-        SESSION_STATES[req.session_id] = prev_state
+        SESSION_STATES[req.session_id] = state
+        public_objs = _public_objectives(state)
+
         logger.info(
             "Chat received after completion: session_id=%s; returning closing message",
             req.session_id,
@@ -232,61 +406,100 @@ def chat():
             ChatResponse(
                 reply=closing,
                 done=True,
-                stage=int(prev_state.get("stage", 0)),
+                stage=int(state.get("stage", 0)),
                 accepted_treatment=True,
                 hints_used=log.hints_used,
                 messages=[],
+                diagnosis_correct=bool(state.get("diagnosis_correct", False)),
+                treatment_hits=int(state.get("treatment_hits", 0)),
+                objectives=[Objective(**o) for o in public_objs],
             ).model_dump()
         )
 
-    # --- HEURISTIC FAST PATH ---
-    text_norm = _norm(req.message)
-    diag_keywords = case.get("diagnosis_keywords") or [case.get("expected_diagnosis", "")]
-    diag_ok = bool(prev_state.get("diagnosis_correct", False))
+    # --- HEURISTICS: Diagnosis / Treatment detection + objectives ---
 
-    if not diag_ok and _contains_any(text_norm, diag_keywords):
-        diag_ok = True
-        prev_state["diagnosis_correct"] = True
+    text = req.message or ""
+    text_norm = _normalize(text)
+
+    # Diagnosis detection
+    diag_keywords = case.get("diagnosis_keywords") or [
+        case.get("expected_diagnosis", "")
+    ]
+    diag_before = bool(state.get("diagnosis_correct", False))
+    diag_after = diag_before
+
+    if not diag_after and _token_overlap_match(text, diag_keywords, min_overlap=2):
+        diag_after = True
+        state["diagnosis_correct"] = True
+        log.diagnosis_correct = True
         logger.info(
             "Diagnosis matched via heuristic: session_id=%s case_id=%s",
             req.session_id,
             case["id"],
         )
 
+    # Treatment detection (only counts once we have some diagnosis)
     treatment_keywords = case.get("treatment_keywords") or case.get(
         "expected_treatment_keywords", []
     )
-    treatment_hits = int(prev_state.get("treatment_hits", 0))
-
-    if diag_ok and treatment_keywords:
-        msg_hits = 0
-        for kw in treatment_keywords:
-            if kw and kw.lower() in text_norm:
-                msg_hits += 1
-        treatment_hits += msg_hits
-        prev_state["treatment_hits"] = treatment_hits
-
-        if msg_hits > 0:
+    treatment_hits_total = int(state.get("treatment_hits", 0))
+    msg_hits = 0
+    if diag_after and treatment_keywords:
+        msg_hits = _count_keyword_hits(text, treatment_keywords)
+        if msg_hits:
+            treatment_hits_total += msg_hits
+            state["treatment_hits"] = treatment_hits_total
+            log.treatment_hits = treatment_hits_total
             logger.info(
                 "Treatment keywords matched: session_id=%s case_id=%s msg_hits=%d total_hits=%d",
                 req.session_id,
                 case["id"],
                 msg_hits,
-                treatment_hits,
+                treatment_hits_total,
             )
 
-    # Heuristic Win
-    if diag_ok and treatment_hits >= 2:
-        prev_state["accepted_treatment"] = True
-        prev_state["done"] = True
-        stage = int(prev_state.get("stage", 0))
+    # Objectives update (unlock "words" the user has actually mentioned)
+    _update_objectives_from_message(state, text)
 
-        # --- SCORING ---
+    # --- Special case: user only gives diagnosis (no treatment yet) ---
+    if not diag_before and diag_after and msg_hits == 0:
+        # Just gave diagnosis for the first time; have patient ask about treatment.
+        expected_dx = case.get("expected_diagnosis", "this condition")
+        reply = (
+            f"Okay doctor, I understand this could be {expected_dx}. "
+            "What treatment or next steps do I need now?"
+        )
+
+        messages.append(AIMessage(content=reply))
+        state["messages"] = messages
+        SESSION_STATES[req.session_id] = state
+
+        public_objs = _public_objectives(state)
+
+        return jsonify(
+            ChatResponse(
+                reply=reply,
+                done=False,
+                stage=int(state.get("stage", 0)),
+                accepted_treatment=False,
+                hints_used=log.hints_used,
+                messages=[],
+                diagnosis_correct=diag_after,
+                treatment_hits=treatment_hits_total,
+                objectives=[Objective(**o) for o in public_objs],
+            ).model_dump()
+        )
+
+    # --- Heuristic "win": diagnosis + enough treatment keywords ---
+    if diag_after and treatment_hits_total >= 2:
+        state["accepted_treatment"] = True
+        state["done"] = True
+        stage = int(state.get("stage", 0))
+
+        # Scoring for heuristic win
         log.score_accuracy = 100
-        # Penalize if user flailed for too many turns
         log.score_thoroughness = 70 if log.turns > 10 else 90
 
-        # Efficiency: Penalize Hints AND Turns
         hint_penalty = log.hints_used * 25
         turn_penalty = max(0, log.turns - 6) * 10
         log.score_efficiency = max(0, 100 - hint_penalty - turn_penalty)
@@ -294,6 +507,7 @@ def chat():
         if log.stage_when_accepted == -1:
             log.stage_when_accepted = stage
         log.accepted_treatment = True
+        log.diagnosis_correct = True
         SESSION_LOGS[req.session_id] = log
 
         logger.info(
@@ -313,7 +527,10 @@ def chat():
             "Mission objectives met. Stand down and access Debrief."
         )
         messages.append(AIMessage(content=closing))
-        SESSION_STATES[req.session_id] = prev_state
+        state["messages"] = messages
+        SESSION_STATES[req.session_id] = state
+
+        public_objs = _public_objectives(state)
 
         return jsonify(
             ChatResponse(
@@ -323,11 +540,14 @@ def chat():
                 accepted_treatment=True,
                 hints_used=log.hints_used,
                 messages=[],
+                diagnosis_correct=True,
+                treatment_hits=treatment_hits_total,
+                objectives=[Objective(**o) for o in public_objs],
             ).model_dump()
         )
 
-    # --- LANGGRAPH SLOW PATH ---
-    result_state = graph_app.invoke(prev_state)
+    # --- LANGGRAPH PATH ---
+    result_state = graph_app.invoke(state)
     SESSION_STATES[req.session_id] = result_state
 
     stage = int(result_state.get("stage", 0))
@@ -336,10 +556,11 @@ def chat():
     if accepted and not log.accepted_treatment:
         log.accepted_treatment = True
         log.stage_when_accepted = stage
-        # Capture the specific scores generated by the LLM
-        log.score_accuracy = result_state.get("score_accuracy", 70)
-        log.score_thoroughness = result_state.get("score_thoroughness", 70)
-        log.score_efficiency = result_state.get("score_efficiency", 70)
+        log.score_accuracy = int(result_state.get("score_accuracy", 70))
+        log.score_thoroughness = int(result_state.get("score_thoroughness", 70))
+        log.score_efficiency = int(result_state.get("score_efficiency", 70))
+        log.diagnosis_correct = True  # evaluator only accepts if dx is correct
+
         logger.info(
             "Case solved via evaluator: session_id=%s case_id=%s stage=%d scores=(acc:%d,th:%d,eff:%d)",
             req.session_id,
@@ -352,6 +573,12 @@ def chat():
     elif log.accepted_treatment:
         accepted = True
 
+    # Carry diagnosis/treatment flags forward into the state/log (if graph didn't overwrite)
+    result_state["diagnosis_correct"] = bool(result_state.get("diagnosis_correct", diag_after))
+    result_state["treatment_hits"] = int(result_state.get("treatment_hits", treatment_hits_total))
+    log.diagnosis_correct = bool(result_state["diagnosis_correct"])
+    log.treatment_hits = int(result_state["treatment_hits"])
+
     SESSION_LOGS[req.session_id] = log
 
     last_ai = ""
@@ -359,6 +586,8 @@ def chat():
         if isinstance(m, AIMessage):
             last_ai = m.content
             break
+
+    public_objs = _public_objectives(result_state)
 
     return jsonify(
         ChatResponse(
@@ -368,6 +597,9 @@ def chat():
             accepted_treatment=accepted,
             hints_used=log.hints_used,
             messages=[],
+            diagnosis_correct=bool(result_state["diagnosis_correct"]),
+            treatment_hits=int(result_state["treatment_hits"]),
+            objectives=[Objective(**o) for o in public_objs],
         ).model_dump()
     )
 
@@ -375,6 +607,7 @@ def chat():
 @app.route("/api/hint", methods=["POST"])
 def hint():
     data = request.get_json(force=True, silent=True) or {}
+    data = _normalize_session_payload(data)
     req = HintRequest(**data)
 
     if req.session_id not in SESSION_CASES:
@@ -407,6 +640,12 @@ def hint():
     log.hints_used += 1
     SESSION_LOGS[req.session_id] = log
 
+    # Keep state in sync for scoring / UI
+    state = SESSION_STATES.get(req.session_id)
+    if state is not None:
+        state["hints_used"] = log.hints_used
+        SESSION_STATES[req.session_id] = state
+
     logger.info(
         "Hint served: session_id=%s case_id=%s hint_index=%d/%d total_hints_used=%d",
         req.session_id,
@@ -425,6 +664,69 @@ def hint():
     )
 
 
+@app.route("/api/reveal-objective", methods=["POST"])
+def reveal_objective():
+    data = request.get_json(force=True, silent=True) or {}
+    data = _normalize_session_payload(data)
+    req = RevealObjectiveRequest(**data)
+
+    session_id = req.session_id
+    if session_id not in SESSION_STATES or session_id not in SESSION_CASES:
+        logger.warning("Reveal requested for invalid session_id=%s", session_id)
+        return jsonify({"error": "INVALID SESSION ID"}), 400
+
+    state = SESSION_STATES[session_id]
+    objs = state.get("objectives") or []
+
+    target = None
+    for obj in objs:
+        if not obj.get("visible"):
+            target = obj
+            break
+
+    if not target:
+        logger.info(
+            "Reveal requested but no hidden objectives left: session_id=%s",
+            session_id,
+        )
+        public_objs = _public_objectives(state)
+        resp = RevealObjectiveResponse(
+            message="No hidden objectives left.",
+            objectives=[Objective(**o) for o in public_objs],
+            reveals_used=int(state.get("reveals_used", 0)),
+        )
+        return jsonify(resp.model_dump())
+
+    target["visible"] = True
+    target["achieved"] = True
+    target["revealed_by_user"] = True
+
+    reveals_used = int(state.get("reveals_used", 0)) + 1
+    state["reveals_used"] = reveals_used
+    state["objectives"] = objs
+    SESSION_STATES[session_id] = state
+
+    log = SESSION_LOGS.get(session_id)
+    if log:
+        log.reveals_used = reveals_used
+        SESSION_LOGS[session_id] = log
+
+    logger.info(
+        "Objective revealed: session_id=%s objective_id=%s reveals_used=%d",
+        session_id,
+        target.get("id"),
+        reveals_used,
+    )
+
+    public_objs = _public_objectives(state)
+    resp = RevealObjectiveResponse(
+        message="Objective revealed at cost of 1 star.",
+        objectives=[Objective(**o) for o in public_objs],
+        reveals_used=reveals_used,
+    )
+    return jsonify(resp.model_dump())
+
+
 @app.route("/api/summary/<session_id>", methods=["GET"])
 def summary(session_id: str):
     if session_id not in SESSION_CASES or session_id not in SESSION_STATES:
@@ -436,70 +738,112 @@ def summary(session_id: str):
     log = SESSION_LOGS.get(session_id)
 
     stage = int(state.get("stage", 0))
-    accepted = bool(state.get("accepted_treatment", log.accepted_treatment if log else False))
+    accepted = bool(
+        state.get("accepted_treatment", log.accepted_treatment if log else False)
+    )
 
     if log and accepted and log.stage_when_accepted == -1:
         log.stage_when_accepted = stage
 
     hints_used = log.hints_used if log else 0
+    reveals_used = log.reveals_used if log else int(state.get("reveals_used", 0))
     stage_when_accepted = (
         log.stage_when_accepted if log and log.stage_when_accepted != -1 else stage
     )
 
-    # --- SCORING LOGIC ---
-    avg_score = (
-        log.score_accuracy + log.score_thoroughness + log.score_efficiency
-    ) / 3 if log else 0
-
-    stars = 0
-    if log and log.accepted_treatment:
-        if avg_score >= 67:
-            stars = 3
-        elif avg_score >= 34:
-            stars = 2
-        else:
-            stars = 1
-
-    diagnosis = case.get("expected_diagnosis", "").upper()
-    turns = log.turns if log else 0
-
-    if log:
-        log.accepted_treatment = accepted
-        log.stars = stars
-        SESSION_LOGS[session_id] = log
-
-    # Update Global Progress
-    key = f"{case['specialty']}|{case['level']}"
-    current_best = USER_PROGRESS.get(key, 0)
-    if stars > current_best:
-        USER_PROGRESS[key] = stars
-
-    logger.info(
-        "Summary generated: session_id=%s case_id=%s stars=%d turns=%d hints=%d scores=(acc:%d,th:%d,eff:%d)",
-        session_id,
-        case["id"],
-        stars,
-        turns,
-        hints_used,
-        log.score_accuracy if log else 0,
-        log.score_thoroughness if log else 0,
-        log.score_efficiency if log else 0,
+    # --- Accuracy flags ---
+    diagnosis_correct = bool(state.get("diagnosis_correct", False))
+    treatment_ok = bool(
+        state.get("accepted_treatment", False)
+        or (log.accepted_treatment if log else False)
     )
 
+    # --- Star scoring (based on correctness, hints, reveals, efficiency) ---
+    if not diagnosis_correct:
+        base_stars = 0
+    elif diagnosis_correct and not treatment_ok:
+        base_stars = 1
+    else:
+        base_stars = 3
+        if hints_used > 0:
+            base_stars -= 1
+        if (log.turns if log else 0) > 12:
+            base_stars -= 1
+        if base_stars < 1:
+            base_stars = 1
+
+    final_stars = max(0, base_stars - reveals_used)
+
+    # Scores: prefer LLM/evaluator scores if present, otherwise simple defaults
+    score_accuracy = log.score_accuracy if log else (100 if diagnosis_correct else 30)
+    score_thoroughness = (
+        log.score_thoroughness if log else (80 if hints_used == 0 else 60)
+    )
+    score_efficiency = log.score_efficiency if log else 70
+
+    turns = log.turns if log else 0
+    diagnosis = (case.get("expected_diagnosis", "") or "").upper()
+
+    if log:
+        log.accepted_treatment = treatment_ok
+        log.stars = final_stars
+        log.score_accuracy = score_accuracy
+        log.score_thoroughness = score_thoroughness
+        log.score_efficiency = score_efficiency
+        log.diagnosis_correct = diagnosis_correct
+        log.reveals_used = reveals_used
+        SESSION_LOGS[session_id] = log
+
+    # Update global progress
+    key = f"{case['specialty']}|{case['level']}"
+    current_best = USER_PROGRESS.get(key, 0)
+    if final_stars > current_best:
+        USER_PROGRESS[key] = final_stars
+
+    # Honest AFTER ACTION REPORT text
+    if not diagnosis_correct:
+        analysis = (
+            "Operator did not reach the correct diagnosis. Further drills on symptom "
+            "patterns and stroke mimics are recommended before advancing difficulty."
+        )
+    elif diagnosis_correct and not treatment_ok:
+        analysis = (
+            "Operator correctly identified the underlying pathology but did not outline "
+            "a complete acute treatment and secondary prevention plan."
+        )
+    else:
+        analysis = (
+            "Operator correctly identified the pathology and proposed an appropriate "
+            "treatment plan. Efficiency is based on number of turns and reliance on hints."
+        )
+
     feedback = (
-        f"/// AFTER ACTION REPORT ///\n"
+        "/// AFTER ACTION REPORT ///\n"
         f"TARGET DIAGNOSIS: {diagnosis}\n"
-        f"PERFORMANCE METRICS:\n"
+        "PERFORMANCE METRICS:\n"
         f"- SENSORY STAGE: {stage_when_accepted}\n"
-        f"- INTEL REQUESTS: {hints_used}\n"
+        f"- INTEL REQUESTS (HINTS): {hints_used}\n"
+        f"- OBJECTIVES REVEALED: {reveals_used}\n"
         f"- TRANSMISSION CYCLES: {turns}\n\n"
-        f"TACTICAL ANALYSIS:\n"
-        f"Operator correctly identified pathology and established containment protocols. "
-        f"Efficiency rating calculated based on speed of diagnosis and reliance on external intel."
+        "TACTICAL ANALYSIS:\n"
+        f"{analysis}"
     )
 
     if state.get("final_feedback"):
         feedback += f"\n\nCOMMAND OVERSIGHT NOTE:\n{state.get('final_feedback')}"
+
+    logger.info(
+        "Summary generated: session_id=%s case_id=%s stars=%d turns=%d hints=%d reveals=%d scores=(acc:%d,th:%d,eff:%d)",
+        session_id,
+        case["id"],
+        final_stars,
+        turns,
+        hints_used,
+        reveals_used,
+        score_accuracy,
+        score_thoroughness,
+        score_efficiency,
+    )
 
     resp = SummaryResponse(
         session_id=session_id,
@@ -509,13 +853,16 @@ def summary(session_id: str):
         diagnosis=diagnosis,
         feedback=feedback,
         turns=turns,
-        accepted_treatment=accepted,
+        accepted_treatment=treatment_ok,
         stage_when_accepted=stage_when_accepted,
         hints_used=hints_used,
-        stars=stars,
-        score_accuracy=log.score_accuracy if log else 0,
-        score_thoroughness=log.score_thoroughness if log else 0,
-        score_efficiency=log.score_efficiency if log else 0,
+        stars=final_stars,
+        score_accuracy=score_accuracy,
+        score_thoroughness=score_thoroughness,
+        score_efficiency=score_efficiency,
+        diagnosis_correct=diagnosis_correct,
+        treatment_ok=treatment_ok,
+        reveals_used=reveals_used,
     )
     return jsonify(resp.model_dump())
 
