@@ -1,4 +1,5 @@
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+// frontend/src/api.js
+import { API_BASE } from "./config";
 
 async function handleResponse(res) {
   const text = await res.text();
@@ -17,19 +18,19 @@ async function handleResponse(res) {
 }
 
 export async function getSpecialties() {
-  const res = await fetch(`${API_BASE_URL}/api/specialties`);
+  const res = await fetch(`${API_BASE}/api/specialties`);
   return handleResponse(res);
 }
 
 export async function getLevels(specialty) {
   const res = await fetch(
-    `${API_BASE_URL}/api/levels?specialty=${encodeURIComponent(specialty)}`
+    `${API_BASE}/api/levels?specialty=${encodeURIComponent(specialty)}`
   );
   return handleResponse(res);
 }
 
 export async function startSession({ specialty, level }) {
-  const res = await fetch(`${API_BASE_URL}/api/start-session`, {
+  const res = await fetch(`${API_BASE}/api/start-session`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ specialty, level }),
@@ -37,25 +38,27 @@ export async function startSession({ specialty, level }) {
   return handleResponse(res);
 }
 
+// IMPORTANT CHANGE: send `sessionId` (camelCase), not `session_id`
 export async function sendChat({ sessionId, message }) {
-  const res = await fetch(`${API_BASE_URL}/api/chat`, {
+  const res = await fetch(`${API_BASE}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId, message }),
+    body: JSON.stringify({ sessionId, message }),
   });
   return handleResponse(res);
 }
 
+// IMPORTANT CHANGE: send `sessionId` here as well
 export async function requestHint({ sessionId }) {
-  const res = await fetch(`${API_BASE_URL}/api/hint`, {
+  const res = await fetch(`${API_BASE}/api/hint`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId }),
+    body: JSON.stringify({ sessionId }),
   });
   return handleResponse(res);
 }
 
 export async function getSummary(sessionId) {
-  const res = await fetch(`${API_BASE_URL}/api/summary/${sessionId}`);
+  const res = await fetch(`${API_BASE}/api/summary/${sessionId}`);
   return handleResponse(res);
 }

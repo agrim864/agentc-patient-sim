@@ -7,12 +7,13 @@ import {
   requestHint,
   getSummary,
 } from "./api";
+import { API_BASE } from "./config";
 
 // --- Utility Functions ---
 
 async function fetchGlobalProgress() {
   try {
-    const res = await fetch("http://localhost:8000/api/progress");
+    const res = await fetch(`${API_BASE}/api/progress`);
     return await res.json();
   } catch (e) {
     console.error("Failed to fetch progress", e);
@@ -22,7 +23,7 @@ async function fetchGlobalProgress() {
 
 async function resetGlobalProgress() {
   try {
-    const res = await fetch("http://localhost:8000/api/reset", { method: "POST" });
+    const res = await fetch(`${API_BASE}/api/reset`, { method: "POST" });
     return await res.json();
   } catch (e) {
     console.error("Failed to reset progress", e);
@@ -73,7 +74,7 @@ function App() {
       try {
         const [specs, progData] = await Promise.all([
           getSpecialties(),
-          fetchGlobalProgress()
+          fetchGlobalProgress(),
         ]);
         setSpecialties(specs);
         if (progData.progress) {
@@ -94,10 +95,10 @@ function App() {
   async function handleResetData() {
     if (!window.confirm("WARNING: CLEARING ALL CAMPAIGN DATA. CONFIRM?")) return;
     try {
-        await resetGlobalProgress();
-        setProgress({}); // Clear local state immediately
+      await resetGlobalProgress();
+      setProgress({});
     } catch (err) {
-        setError("RESET FAILED");
+      setError("RESET FAILED");
     }
   }
 
@@ -201,27 +202,26 @@ function App() {
     try {
       const data = await getSummary(session.session_id);
       setSummaryState(data);
-      
+
       // Update local progress instantly if this run was better
       if (session && session.specialty && session.level != null) {
         const key = `${session.specialty}|${session.level}`;
         const earnedStars = data.stars || 0;
-        
-        setProgress(prev => {
-            const current = prev[key] || 0;
-            if (earnedStars >= current) {
-                return { ...prev, [key]: earnedStars };
-            }
-            return prev;
+
+        setProgress((prev) => {
+          const current = prev[key] || 0;
+          if (earnedStars >= current) {
+            return { ...prev, [key]: earnedStars };
+          }
+          return prev;
         });
       }
-      
+
       // Double check sync with backend
       const progData = await fetchGlobalProgress();
       if (progData.progress) {
-          setProgress(prev => ({ ...prev, ...progData.progress }));
+        setProgress((prev) => ({ ...prev, ...progData.progress }));
       }
-
     } catch (err) {
       setError("DEBRIEF FAILED");
     } finally {
@@ -267,9 +267,7 @@ function App() {
 
   const rank = session && session.level ? getRankFromLevel(session.level) : "CADET";
 
-  // Calculate Levels Completed
   const totalCompleted = Object.keys(progress).length;
-  // Assumption: 5 specialties * 5 levels = 25 total
   const totalLevels = 25; 
   const progressPercent = Math.round((totalCompleted / totalLevels) * 100);
 
@@ -312,27 +310,28 @@ function App() {
               selectedLevel={selectedLevel}
               summary={summary}
             />
-            
-            {/* NEW: Campaign Progress Panel */}
+
             <div className="hud-card info-card campaign-panel">
-                <div className="hud-card-header small">CAMPAIGN PROGRESS</div>
-                <div className="status-row small">
-                    <span className="label">COMPLETED</span>
-                    <span className="value">{totalCompleted}/{totalLevels}</span>
+              <div className="hud-card-header small">CAMPAIGN PROGRESS</div>
+              <div className="status-row small">
+                <span className="label">COMPLETED</span>
+                <span className="value">
+                  {totalCompleted}/{totalLevels}
+                </span>
+              </div>
+              <div className="xp-container">
+                <div className="xp-bar">
+                  <div
+                    className="xp-fill"
+                    style={{ width: `${progressPercent}%`, background: "var(--success)" }}
+                  ></div>
                 </div>
-                <div className="xp-container">
-                    <div className="xp-bar">
-                        <div 
-                            className="xp-fill" 
-                            style={{ width: `${progressPercent}%`, background: 'var(--success)' }}
-                        ></div>
-                    </div>
-                </div>
-                <div style={{ marginTop: '15px', textAlign: 'center' }}>
-                    <button className="hud-btn alert small" onClick={handleResetData}>
-                        RESET DATA
-                    </button>
-                </div>
+              </div>
+              <div style={{ marginTop: "15px", textAlign: "center" }}>
+                <button className="hud-btn alert small" onClick={handleResetData}>
+                  RESET DATA
+                </button>
+              </div>
             </div>
 
             {error && <div className="error-banner">⚠ ALERT: {error}</div>}
@@ -415,7 +414,9 @@ function GameInfo({ step, session, selectedSpecialty, selectedLevel, summary }) 
       {session && (
         <div className="active-mission-stats">
           <div className="mission-tags">
-            <span className="tag tech">{session.specialty.substring(0, 3).toUpperCase()}</span>
+            <span className="tag tech">
+              {session.specialty.substring(0, 3).toUpperCase()}
+            </span>
             <span className="tag warning">LVL {session.level}</span>
           </div>
           <div className="patient-file">
@@ -470,9 +471,13 @@ function LevelScreen({ specialty, levels, loading, onBack, onSelectLevel, progre
   return (
     <div className="screen-container">
       <div className="screen-header row">
-        <button className="hud-btn small" onClick={onBack}>&lt; BACK</button>
+        <button className="hud-btn small" onClick={onBack}>
+          &lt; BACK
+        </button>
         <div>
-          <h2 className="screen-title">SECTOR: {specialty ? specialty.toUpperCase() : "UNKNOWN"}</h2>
+          <h2 className="screen-title">
+            SECTOR: {specialty ? specialty.toUpperCase() : "UNKNOWN"}
+          </h2>
           <p className="screen-subtitle">Select simulation difficulty.</p>
         </div>
       </div>
@@ -483,16 +488,22 @@ function LevelScreen({ specialty, levels, loading, onBack, onSelectLevel, progre
         {levels.map((level) => {
           let badgeClass = "badge-medium";
           let diffText = "STD";
-          if (level <= 2) { badgeClass = "badge-easy"; diffText = "BAS"; }
-          if (level >= 4) { badgeClass = "badge-hard"; diffText = "ADV"; }
+          if (level <= 2) {
+            badgeClass = "badge-easy";
+            diffText = "BAS";
+          }
+          if (level >= 4) {
+            badgeClass = "badge-hard";
+            diffText = "ADV";
+          }
 
           const key = `${specialty}|${level}`;
           const stars = progress[key];
 
           return (
-            <button 
-              key={level} 
-              className={`game-card-btn level ${stars ? 'completed' : ''}`} 
+            <button
+              key={level}
+              className={`game-card-btn level ${stars ? "completed" : ""}`}
               onClick={() => onSelectLevel(level)}
             >
               <div className="level-number">{level}</div>
@@ -501,7 +512,6 @@ function LevelScreen({ specialty, levels, loading, onBack, onSelectLevel, progre
                   <span className={`badge ${badgeClass}`}>{diffText}</span>
                   <div className="card-title">SIMULATION {level}</div>
                 </div>
-                {/* Ensure stars are rendered if they exist, even if 0 */}
                 {stars !== undefined && (
                   <div className="level-stars">
                     {"★".repeat(stars)}
@@ -545,8 +555,12 @@ function ChatScreen({
             </div>
           </div>
           <div className="chat-controls">
-            <button className="hud-btn small" onClick={onBackToLevel}>LEVELS</button>
-            <button className="hud-btn small" onClick={onBackToSpecialty}>SECTORS</button>
+            <button className="hud-btn small" onClick={onBackToLevel}>
+              LEVELS
+            </button>
+            <button className="hud-btn small" onClick={onBackToSpecialty}>
+              SECTORS
+            </button>
           </div>
         </div>
 
@@ -559,9 +573,7 @@ function ChatScreen({
 
         <div className="chat-window">
           <div className="chat-messages-container">
-            {messages.length === 0 && (
-              <div className="chat-empty">AWAITING INPUT...</div>
-            )}
+            {messages.length === 0 && <div className="chat-empty">AWAITING INPUT...</div>}
             {messages.map((m, idx) => (
               <MessageBubble key={idx} role={m.role} content={m.content} />
             ))}
@@ -622,27 +634,29 @@ function StarRow({ stars }) {
   return (
     <div className="star-row">
       {[1, 2, 3].map((i) => (
-        <span key={i} className={`game-star ${i <= stars ? "filled" : "empty"}`}>★</span>
+        <span key={i} className={`game-star ${i <= stars ? "filled" : "empty"}`}>
+          ★
+        </span>
       ))}
     </div>
   );
 }
 
 function MetricBar({ label, value, color }) {
-    return (
-        <div className="metric-row">
-            <div className="metric-header">
-                <span className="metric-label">{label}</span>
-                <span className="metric-val">{value}%</span>
-            </div>
-            <div className="xp-bar" style={{height: "4px", background: "#333"}}>
-                <div 
-                    className="xp-fill" 
-                    style={{ width: `${value}%`, background: color, boxShadow: `0 0 8px ${color}` }}
-                ></div>
-            </div>
-        </div>
-    );
+  return (
+    <div className="metric-row">
+      <div className="metric-header">
+        <span className="metric-label">{label}</span>
+        <span className="metric-val">{value}%</span>
+      </div>
+      <div className="xp-bar" style={{ height: "4px", background: "#333" }}>
+        <div
+          className="xp-fill"
+          style={{ width: `${value}%`, background: color, boxShadow: `0 0 8px ${color}` }}
+        ></div>
+      </div>
+    </div>
+  );
 }
 
 function SummaryPanel({ summary }) {
@@ -654,11 +668,11 @@ function SummaryPanel({ summary }) {
   return (
     <div className="hud-card summary-card">
       <div className="hud-card-header">MISSION DEBRIEF</div>
-      
+
       <div className="score-display">
-         <div className="big-score">{avg}</div>
-         <div className="score-label">OVERALL RATING</div>
-         <StarRow stars={summary.stars} />
+        <div className="big-score">{avg}</div>
+        <div className="score-label">OVERALL RATING</div>
+        <StarRow stars={summary.stars} />
       </div>
 
       <div className="metrics-grid">
@@ -667,12 +681,8 @@ function SummaryPanel({ summary }) {
         <MetricBar label="SPEED/EFF" value={eff} color="var(--warning)" />
       </div>
 
-      <div className="terminal-text">
-        {summary.feedback}
-      </div>
-      <div className="summary-footer">
-        SIMULATION COMPLETE. DATA LOGGED.
-      </div>
+      <div className="terminal-text">{summary.feedback}</div>
+      <div className="summary-footer">SIMULATION COMPLETE. DATA LOGGED.</div>
     </div>
   );
 }
