@@ -1,0 +1,11 @@
+flask
+flask-cors
+
+langchain-core
+langgraph
+langgraph-checkpoint
+
+langchain-huggingface
+pydantic
+
+python-dotenv
