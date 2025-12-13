@@ -9,3 +9,7 @@ langchain-huggingface
 pydantic
 
 python-dotenv
+
+gunicorn
+
+langchain-google-genai
