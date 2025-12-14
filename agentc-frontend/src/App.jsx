@@ -129,28 +129,57 @@ function App() {
   const [objectives, setObjectives] = useState([]);
   const [revealsUsed, setRevealsUsed] = useState(0);
 
+  // Boot / loading state
+  const [bootStage, setBootStage] = useState("connecting"); // "connecting" | "syncing" | "ready" | "error"
+  const [bootMessage, setBootMessage] = useState("Initializing client...");
+
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
   }, [theme]);
 
-  // Initial Load: Specialties + Progress
-  useEffect(() => {
-    async function load() {
-      try {
-        const [specs, progData] = await Promise.all([
-          getSpecialties(),
-          fetchGlobalProgress(),
-        ]);
-        setSpecialties(specs);
-        if (progData.progress) {
-          setProgress(progData.progress);
-        }
-      } catch (err) {
-        console.error(err);
-        setError("SYSTEM FAILURE: CONNECTION REFUSED");
+  // Initial boot: load specialties + campaign progress with status messages
+  async function loadInitialData() {
+    setError("");
+    setBootStage("connecting");
+    setBootMessage(`Connecting to mission server at ${API_BASE}...`);
+
+    try {
+      // 1) Get specialty sectors
+      const specs = await getSpecialties();
+      setSpecialties(specs);
+
+      // 2) Sync progress
+      setBootStage("syncing");
+      setBootMessage("Syncing campaign progress from backend...");
+
+      const progData = await fetchGlobalProgress();
+      if (progData.progress) {
+        setProgress(progData.progress);
       }
+
+      // 3) Ready
+      setBootStage("ready");
+      setBootMessage("Link established. Select a specialty sector to begin.");
+    } catch (err) {
+      console.error("Initial boot failed", err);
+      setError("SYSTEM FAILURE: CONNECTION REFUSED");
+      setBootStage("error");
+      setBootMessage(
+        [
+          "Could not reach backend.",
+          "",
+          "Quick checks:",
+          "- Is the backend running and reachable?",
+          "- If frontend is on Vercel, make sure API_BASE points to your Render/Flask URL (not localhost).",
+          "- On phone: localhost backends on your laptop will NOT work; use the deployed backend URL.",
+        ].join("\n")
+      );
     }
-    load();
+  }
+
+  // Initial Load: run boot sequence
+  useEffect(() => {
+    loadInitialData();
   }, []);
 
   function toggleTheme() {
@@ -170,30 +199,28 @@ function App() {
   }
 
   async function handleSpecialtyClick(spec) {
-  setSelectedSpecialty(spec);
-  setSelectedLevel(null);
-  setError("");
-  setLevels([]);
-  setHint("");
-  setSummaryState(null);
-  setMessages([]);
-  setSession(null);
-  setHintsUsed(0);
-  setObjectives([]);
-  setRevealsUsed(0);
+    setSelectedSpecialty(spec);
+    setSelectedLevel(null);
+    setError("");
+    setLevels([]);
+    setHint("");
+    setSummaryState(null);
+    setMessages([]);
+    setSession(null);
+    setHintsUsed(0);
+    setObjectives([]);
+    setRevealsUsed(0);
 
-  // THIS LINE WAS MISSING
-  setStep("level");
+    setStep("level");
 
-  try {
-    const data = await getLevels(spec);
-    setLevels(data);
-  } catch (err) {
-    console.error(err);
-    setError("SYSTEM FAILURE: SECTOR LOCKED");
+    try {
+      const data = await getLevels(spec);
+      setLevels(data);
+    } catch (err) {
+      console.error(err);
+      setError("SYSTEM FAILURE: SECTOR LOCKED");
+    }
   }
-}
-
 
   async function handleLevelClick(level) {
     setSelectedLevel(level);
@@ -423,13 +450,19 @@ function App() {
   );
   const rankInfo = getRankInfo(totalStars);
 
-  const starsLeftThisLevel = Math.max(
-    0,
-    MAX_REVEALS_PER_LEVEL - revealsUsed
-  );
+  const starsLeftThisLevel = Math.max(0, MAX_REVEALS_PER_LEVEL - revealsUsed);
+
+  const showBootScreen = bootStage !== "ready";
 
   return (
     <div className="app-root">
+      {showBootScreen && (
+        <BootScreen
+          stage={bootStage}
+          message={bootMessage}
+          onRetry={bootStage === "error" ? loadInitialData : null}
+        />
+      )}
       <div className="scanlines"></div>
       <div className="app-layout">
         <header className="app-header">
@@ -456,7 +489,7 @@ function App() {
                   : " (MAX)"}
               </span>
             </div>
-            {session && (
+            {session && !showBootScreen && (
               <button className="hud-btn alert small" onClick={handleNewCase}>
                 ABORT / NEW
               </button>
@@ -482,7 +515,9 @@ function App() {
               </div>
               <div className="status-row small">
                 <span className="label">STARS</span>
-                <span className="value">{totalStars}/{GLOBAL_MAX_STARS}</span>
+                <span className="value">
+                  {totalStars}/{GLOBAL_MAX_STARS}
+                </span>
               </div>
               <div className="status-row small">
                 <span className="label">MISSIONS CLEARED</span>
@@ -967,6 +1002,48 @@ function SummaryPanel({ summary }) {
 
       <div className="terminal-text">{summary.feedback}</div>
       <div className="summary-footer">SIMULATION COMPLETE. DATA LOGGED.</div>
+    </div>
+  );
+}
+
+function BootScreen({ stage, message, onRetry }) {
+  const isError = stage === "error";
+
+  const statusText =
+    stage === "ready"
+      ? "ONLINE"
+      : stage === "error"
+      ? "OFFLINE – BACKEND UNREACHABLE"
+      : stage === "syncing"
+      ? "SYNCING CAMPAIGN PROGRESS..."
+      : "CONNECTING TO BACKEND...";
+
+  return (
+    <div className="boot-screen">
+      <div className="boot-panel">
+        <div className="boot-title">AGENT-C BOOT SEQUENCE</div>
+        <div className="boot-status-line">{statusText}</div>
+
+        <div className="boot-log">
+          <div className="boot-step">
+            [1/3] Connect to backend ({API_BASE})
+          </div>
+          <div className="boot-step">[2/3] Sync campaign progress</div>
+          <div className="boot-step">[3/3] Load specialty sectors UI</div>
+        </div>
+
+        <pre className="boot-message">{message}</pre>
+
+        {isError && onRetry && (
+          <button
+            type="button"
+            className="hud-btn alert small"
+            onClick={onRetry}
+          >
+            RETRY CONNECTION
+          </button>
+        )}
+      </div>
     </div>
   );
 }

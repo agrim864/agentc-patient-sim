@@ -804,3 +804,81 @@ html[data-theme="light"] .level-stars {
   opacity: 0.85;
   text-align: right;
 }
+
+/* Boot / loading screen overlay */
+
+.boot-screen {
+  position: fixed;
+  inset: 0;
+  background: radial-gradient(
+    circle at top,
+    rgba(15, 23, 42, 0.96) 0%,
+    rgba(15, 23, 42, 0.98) 40%,
+    #020617 100%
+  );
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1001;
+}
+
+.boot-panel {
+  background: var(--bg-panel-trans);
+  border: 1px solid var(--border-color);
+  border-left: 4px solid var(--primary);
+  border-radius: var(--corner-rad);
+  padding: 20px;
+  width: min(420px, 90vw);
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
+  font-family: var(--font-mono);
+  animation: bootFadeIn 0.3s ease-out;
+}
+
+.boot-title {
+  font-family: var(--font-head);
+  font-size: 14px;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+  color: var(--text-highlight);
+}
+
+.boot-status-line {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-bottom: 10px;
+}
+
+.boot-log {
+  font-size: 10px;
+  background: #020617;
+  border: 1px solid var(--border-color);
+  padding: 8px;
+  margin-bottom: 10px;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.boot-step {
+  opacity: 0.8;
+  margin-bottom: 2px;
+}
+
+.boot-message {
+  font-size: 10px;
+  white-space: pre-wrap;
+  color: var(--text-dim);
+  margin: 0 0 10px 0;
+}
+
+@keyframes bootFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
