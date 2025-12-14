@@ -1,5 +1,5 @@
 // frontend/src/App.jsx
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   getSpecialties,
   getLevels,
@@ -8,8 +8,6 @@ import {
   requestHint,
   getSummary,
   revealObjective,
-  getProgress as apiGetProgress,
-  resetProgress as apiResetProgress,
 } from "./api";
 import { API_BASE } from "./config";
 
@@ -21,7 +19,7 @@ import { API_BASE } from "./config";
 // 40–49★ : ATTENDING
 // 50–59★ : CHIEF
 // 60–69★ : LEGEND
-// 70–75★ : HIPPOCRATES
+// 70+★ : HIPPOCRATES
 const RANK_TIERS = [
   { name: "STUDENT", minStars: 0 },
   { name: "INTERN", minStars: 10 },
@@ -34,31 +32,96 @@ const RANK_TIERS = [
 ];
 
 const MAX_REVEALS_PER_LEVEL = 3;
-const TOTAL_LEVELS = 25;
-const GLOBAL_MAX_STARS = TOTAL_LEVELS * 3;
+const LOCAL_PROGRESS_KEY = "agentc_progress_v1";
 
-function getRankInfo(totalStarsRaw) {
+function clampStars(v) {
+  const n = Number(v || 0);
+  if (Number.isNaN(n)) return 0;
+  return Math.max(0, Math.min(3, n));
+}
+
+function loadLocalProgress() {
+  try {
+    const raw = localStorage.getItem(LOCAL_PROGRESS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") return parsed;
+    return {};
+  } catch {
+    return {};
+  }
+}
+
+function saveLocalProgress(progressObj) {
+  try {
+    localStorage.setItem(LOCAL_PROGRESS_KEY, JSON.stringify(progressObj || {}));
+  } catch {
+    // ignore
+  }
+}
+
+function resetLocalProgress() {
+  try {
+    localStorage.removeItem(LOCAL_PROGRESS_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+// Encode progress into ONE numeric code (base-4 packed into a BigInt, then shown as base-10 digits).
+// Order must be stable: missionKeys sorted by specialty then level.
+function encodeProgressToCode(progress, missionKeys) {
+  if (!missionKeys || missionKeys.length === 0) return "";
+  let n = 0n;
+  let pow = 1n; // 4^0
+  for (let i = 0; i < missionKeys.length; i++) {
+    const key = missionKeys[i];
+    const digit = BigInt(clampStars(progress?.[key] || 0)); // 0..3
+    n += digit * pow;
+    pow *= 4n;
+  }
+  return n.toString(10);
+}
+
+function decodeCodeToProgress(codeStr, missionKeys) {
+  const cleaned = (codeStr || "").trim();
+  if (!/^\d+$/.test(cleaned)) {
+    throw new Error("Code must be numbers only.");
+  }
+  if (!missionKeys || missionKeys.length === 0) {
+    throw new Error("Mission map not loaded yet.");
+  }
+
+  let n = BigInt(cleaned);
+  const out = {};
+  for (let i = 0; i < missionKeys.length; i++) {
+    const digit = Number(n % 4n); // 0..3
+    if (digit > 0) out[missionKeys[i]] = digit;
+    n = n / 4n;
+  }
+  return out;
+}
+
+function getRankInfo(totalStarsRaw, globalMaxStarsRaw) {
   const stars = Math.max(0, totalStarsRaw || 0);
+  const globalMaxStars = Math.max(1, globalMaxStarsRaw || 1);
 
   // pick highest tier whose minStars <= stars
   let currentIndex = 0;
   for (let i = 0; i < RANK_TIERS.length; i++) {
-    if (stars >= RANK_TIERS[i].minStars) {
-      currentIndex = i;
-    } else {
-      break;
-    }
+    if (stars >= RANK_TIERS[i].minStars) currentIndex = i;
+    else break;
   }
 
   const current = RANK_TIERS[currentIndex];
   const next = RANK_TIERS[currentIndex + 1] || null;
 
   const currentFloor = current.minStars;
-  const nextFloor = next ? next.minStars : GLOBAL_MAX_STARS;
+  const nextFloor = next ? next.minStars : globalMaxStars;
 
   let progressFraction = 0;
   if (!next) {
-    const spanToMax = Math.max(1, GLOBAL_MAX_STARS - currentFloor);
+    const spanToMax = Math.max(1, globalMaxStars - currentFloor);
     progressFraction = Math.min(1, (stars - currentFloor) / spanToMax);
   } else {
     const span = Math.max(1, nextFloor - currentFloor);
@@ -75,31 +138,6 @@ function getRankInfo(totalStarsRaw) {
     progressPercent,
   };
 }
-
-// --- Utility Functions for global progress ---
-// (These just wrap the API helpers; kept here for clarity)
-
-async function fetchGlobalProgress() {
-  try {
-    const data = await apiGetProgress();
-    return data;
-  } catch (e) {
-    console.error("Failed to fetch progress", e);
-    return { progress: {} };
-  }
-}
-
-async function resetGlobalProgress() {
-  try {
-    const data = await apiResetProgress();
-    return data;
-  } catch (e) {
-    console.error("Failed to reset progress", e);
-    return { progress: {} };
-  }
-}
-
-// --- Main Component ---
 
 function App() {
   const [step, setStep] = useState("specialty"); // "specialty" | "level" | "chat"
@@ -121,7 +159,7 @@ function App() {
   const [summary, setSummaryState] = useState(null);
   const [error, setError] = useState("");
 
-  const [progress, setProgress] = useState({});
+  const [progress, setProgress] = useState(() => loadLocalProgress());
   const [theme, setTheme] = useState("dark");
 
   // per-level usage
@@ -133,31 +171,54 @@ function App() {
   const [bootStage, setBootStage] = useState("connecting"); // "connecting" | "syncing" | "ready" | "error"
   const [bootMessage, setBootMessage] = useState("Initializing client...");
 
+  // Mission map (stable ordering for restore-code)
+  const [missionKeys, setMissionKeys] = useState([]);
+
+  // Restore code UI state
+  const [restoreCodeInput, setRestoreCodeInput] = useState("");
+  const [restoreStatus, setRestoreStatus] = useState("");
+
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
   }, [theme]);
 
-  // Initial boot: load specialties + campaign progress with status messages
+  // Persist local progress whenever it changes
+  useEffect(() => {
+    saveLocalProgress(progress);
+  }, [progress]);
+
   async function loadInitialData() {
     setError("");
     setBootStage("connecting");
     setBootMessage(`Connecting to mission server at ${API_BASE}...`);
 
     try {
-      // 1) Get specialty sectors
+      // 1) Get specialties
       const specs = await getSpecialties();
       setSpecialties(specs);
 
-      // 2) Sync progress
+      // 2) Build mission map (specialty|level keys) for restore-code stability
       setBootStage("syncing");
-      setBootMessage("Syncing campaign progress from backend...");
+      setBootMessage("Loading mission map + local campaign progress...");
 
-      const progData = await fetchGlobalProgress();
-      if (progData.progress) {
-        setProgress(progData.progress);
-      }
+      const allLevels = await Promise.all(
+        specs.map(async (spec) => {
+          const lvls = await getLevels(spec);
+          return { spec, lvls: Array.isArray(lvls) ? lvls : [] };
+        })
+      );
 
-      // 3) Ready
+      const keys = [];
+      allLevels
+        .sort((a, b) => String(a.spec).localeCompare(String(b.spec)))
+        .forEach(({ spec, lvls }) => {
+          const sortedLvls = [...lvls].sort((x, y) => Number(x) - Number(y));
+          sortedLvls.forEach((lvl) => keys.push(`${spec}|${lvl}`));
+        });
+
+      setMissionKeys(keys);
+
+      // 3) Local progress already loaded from localStorage (state init)
       setBootStage("ready");
       setBootMessage("Link established. Select a specialty sector to begin.");
     } catch (err) {
@@ -177,25 +238,20 @@ function App() {
     }
   }
 
-  // Initial Load: run boot sequence
   useEffect(() => {
     loadInitialData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function toggleTheme() {
     setTheme((prev) => (prev === "light" ? "dark" : "light"));
   }
 
-  // --- Reset Handler ---
   async function handleResetData() {
-    if (!window.confirm("WARNING: CLEARING ALL CAMPAIGN DATA. CONFIRM?")) return;
-    try {
-      const data = await resetGlobalProgress();
-      setProgress(data.progress || {});
-    } catch (err) {
-      console.error(err);
-      setError("RESET FAILED");
-    }
+    if (!window.confirm("WARNING: CLEARING LOCAL CAMPAIGN DATA ON THIS DEVICE. CONFIRM?")) return;
+    resetLocalProgress();
+    setProgress({});
+    setRestoreStatus("Local campaign data cleared.");
   }
 
   async function handleSpecialtyClick(spec) {
@@ -309,9 +365,7 @@ function App() {
     setHintLoading(true);
     try {
       const data = await requestHint({ sessionId: session.session_id });
-      setHint(
-        `[INTEL RECEIVED] Hint ${data.hint_index}/${data.total_hints}: ${data.hint}`
-      );
+      setHint(`[INTEL RECEIVED] Hint ${data.hint_index}/${data.total_hints}: ${data.hint}`);
       setHintsUsed((prev) => prev + 1);
     } catch (err) {
       console.error(err);
@@ -343,11 +397,7 @@ function App() {
       if (Array.isArray(data.objectives)) {
         setObjectives(data.objectives);
       }
-      setRevealsUsed(
-        typeof data.reveals_used === "number"
-          ? data.reveals_used
-          : revealsUsed + 1
-      );
+      setRevealsUsed(typeof data.reveals_used === "number" ? data.reveals_used : revealsUsed + 1);
       setHint(`[OBJECTIVE REVEALED] ${data.message}`);
     } catch (err) {
       console.error(err);
@@ -365,24 +415,21 @@ function App() {
       const data = await getSummary(session.session_id);
       setSummaryState(data);
 
-      // Update local progress instantly if this run was better
+      // Update local progress on THIS device only
       if (session && session.specialty && session.level != null) {
         const key = `${session.specialty}|${session.level}`;
-        const earnedStars = data.stars || 0;
+        const earnedStars = clampStars(data.stars || 0);
 
         setProgress((prev) => {
-          const current = prev[key] || 0;
+          const current = clampStars(prev[key] || 0);
           if (earnedStars >= current) {
-            return { ...prev, [key]: earnedStars };
+            const next = { ...prev, [key]: earnedStars };
+            // keep storage compact: remove 0-star entries
+            if (earnedStars === 0) delete next[key];
+            return next;
           }
           return prev;
         });
-      }
-
-      // Double check sync with backend
-      const progData = await fetchGlobalProgress();
-      if (progData.progress) {
-        setProgress((prev) => ({ ...prev, ...progData.progress }));
       }
 
       // Sync revealsUsed from backend summary if available
@@ -442,53 +489,74 @@ function App() {
     setSelectedLevel(null);
   }
 
-  const totalCompleted = Object.keys(progress).length;
+  const totalCompleted = Object.values(progress || {}).filter((v) => (v || 0) > 0).length;
+  const totalStars = Object.values(progress || {}).reduce((sum, v) => sum + (v || 0), 0);
 
-  const totalStars = Object.values(progress || {}).reduce(
-    (sum, v) => sum + (v || 0),
-    0
-  );
-  const rankInfo = getRankInfo(totalStars);
+  const globalMaxStars = Math.max(1, (missionKeys?.length || 0) * 3);
+  const rankInfo = getRankInfo(totalStars, globalMaxStars);
 
   const starsLeftThisLevel = Math.max(0, MAX_REVEALS_PER_LEVEL - revealsUsed);
-
   const showBootScreen = bootStage !== "ready";
+
+  const currentSaveCode = useMemo(() => encodeProgressToCode(progress, missionKeys), [progress, missionKeys]);
+
+  async function handleCopySaveCode() {
+    try {
+      await navigator.clipboard.writeText(currentSaveCode || "");
+      setRestoreStatus("Save code copied.");
+      setTimeout(() => setRestoreStatus(""), 2000);
+    } catch {
+      setRestoreStatus("Copy failed. Select the code and copy manually.");
+      setTimeout(() => setRestoreStatus(""), 3000);
+    }
+  }
+
+  function handleRestoreFromCode() {
+    setError("");
+    setRestoreStatus("");
+    try {
+      const restored = decodeCodeToProgress(restoreCodeInput, missionKeys);
+      setProgress(restored);
+      setRestoreStatus("Progress restored on this device.");
+      setTimeout(() => setRestoreStatus(""), 2500);
+    } catch (e) {
+      setRestoreStatus(`Restore failed: ${e.message}`);
+      setTimeout(() => setRestoreStatus(""), 3500);
+    }
+  }
 
   return (
     <div className="app-root">
       {showBootScreen && (
-        <BootScreen
-          stage={bootStage}
-          message={bootMessage}
-          onRetry={bootStage === "error" ? loadInitialData : null}
-        />
+        <BootScreen stage={bootStage} message={bootMessage} onRetry={bootStage === "error" ? loadInitialData : null} />
       )}
+
       <div className="scanlines"></div>
+
       <div className="app-layout">
         <header className="app-header">
           <div className="header-branding">
             <div className="app-logo-box">AG-C</div>
             <div>
               <div className="app-title">AGENT-C SIMULATOR</div>
-              <div className="app-subtitle">
-                TACTICAL MEDICAL TRAINING INTERFACE
-              </div>
+              <div className="app-subtitle">TACTICAL MEDICAL TRAINING INTERFACE</div>
             </div>
           </div>
+
           <div className="header-right">
             <button type="button" className="hud-btn small" onClick={toggleTheme}>
               {theme === "light" ? "☾ NIGHT" : "☀ DAY"}
             </button>
+
             <div className="rank-display">
               <span className="rank-label">CURRENT RANK</span>
               <span className="rank-value">{rankInfo.name}</span>
               <span className="rank-stars">
                 {totalStars}★
-                {rankInfo.nextName
-                  ? ` → ${rankInfo.nextName} @ ${rankInfo.nextFloor}★`
-                  : " (MAX)"}
+                {rankInfo.nextName ? ` → ${rankInfo.nextName} @ ${rankInfo.nextFloor}★` : " (MAX)"}
               </span>
             </div>
+
             {session && !showBootScreen && (
               <button className="hud-btn alert small" onClick={handleNewCase}>
                 ABORT / NEW
@@ -508,23 +576,27 @@ function App() {
             />
 
             <div className="hud-card info-card campaign-panel">
-              <div className="hud-card-header small">CAMPAIGN PROGRESS</div>
+              <div className="hud-card-header small">CAMPAIGN PROGRESS (DEVICE)</div>
+
               <div className="status-row small">
                 <span className="label">RANK</span>
                 <span className="value">{rankInfo.name}</span>
               </div>
+
               <div className="status-row small">
                 <span className="label">STARS</span>
                 <span className="value">
-                  {totalStars}/{GLOBAL_MAX_STARS}
+                  {totalStars}/{globalMaxStars}
                 </span>
               </div>
+
               <div className="status-row small">
                 <span className="label">MISSIONS CLEARED</span>
                 <span className="value">
-                  {totalCompleted}/{TOTAL_LEVELS}
+                  {totalCompleted}/{missionKeys.length || 0}
                 </span>
               </div>
+
               <div className="xp-container">
                 <div className="xp-bar">
                   <div
@@ -538,12 +610,13 @@ function App() {
                 <div className="xp-label">
                   {rankInfo.nextName
                     ? `${totalStars} / ${rankInfo.nextFloor}★ to ${rankInfo.nextName}`
-                    : `${totalStars} / ${GLOBAL_MAX_STARS}★ (MAX RANK)`}
+                    : `${totalStars} / ${globalMaxStars}★ (MAX RANK)`}
                 </div>
               </div>
+
               <div style={{ marginTop: "15px", textAlign: "center" }}>
                 <button className="hud-btn alert small" onClick={handleResetData}>
-                  RESET DATA
+                  RESET LOCAL DATA
                 </button>
               </div>
             </div>
@@ -557,6 +630,12 @@ function App() {
                 <SpecialtyScreen
                   specialties={specialties}
                   onSelect={handleSpecialtyClick}
+                  saveCode={currentSaveCode}
+                  restoreCodeInput={restoreCodeInput}
+                  onRestoreCodeInput={setRestoreCodeInput}
+                  onRestore={handleRestoreFromCode}
+                  onCopy={handleCopySaveCode}
+                  restoreStatus={restoreStatus}
                 />
               )}
 
@@ -613,11 +692,7 @@ function GameInfo({ step, session, selectedSpecialty, selectedLevel, summary }) 
           <div className="status-row">
             <span className="label">PHASE</span>
             <span className="value blink">
-              {step === "specialty"
-                ? "SELECT SPEC"
-                : step === "level"
-                ? "SELECT DIFF"
-                : "ACTIVE"}
+              {step === "specialty" ? "SELECT SPEC" : step === "level" ? "SELECT DIFF" : "ACTIVE"}
             </span>
           </div>
           {selectedSpecialty && (
@@ -638,9 +713,7 @@ function GameInfo({ step, session, selectedSpecialty, selectedLevel, summary }) 
       {session && (
         <div className="active-mission-stats">
           <div className="mission-tags">
-            <span className="tag tech">
-              {session.specialty.substring(0, 3).toUpperCase()}
-            </span>
+            <span className="tag tech">{session.specialty.substring(0, 3).toUpperCase()}</span>
             <span className="tag warning">LVL {session.level}</span>
           </div>
           <div className="patient-file">
@@ -669,20 +742,69 @@ function GameInfo({ step, session, selectedSpecialty, selectedLevel, summary }) 
   );
 }
 
-function SpecialtyScreen({ specialties, onSelect }) {
+function SpecialtyScreen({
+  specialties,
+  onSelect,
+  saveCode,
+  restoreCodeInput,
+  onRestoreCodeInput,
+  onRestore,
+  onCopy,
+  restoreStatus,
+}) {
   return (
     <div className="screen-container">
       <div className="screen-header">
         <h2 className="screen-title">SELECT SPECIALTY SECTOR</h2>
         <p className="screen-subtitle">Identify training module to commence.</p>
       </div>
-      <div className="grid">
+
+      <div className="hud-card savecode-card">
+        <div className="hud-card-header small">SAVE / RESTORE (NUMERIC CODE)</div>
+
+        <div className="savecode-row">
+          <div className="savecode-label">YOUR SAVE CODE</div>
+          <div className="savecode-code">{saveCode || "0"}</div>
+        </div>
+
+        <div className="savecode-actions">
+          <button type="button" className="hud-btn secondary small" onClick={onCopy} disabled={!saveCode}>
+            COPY
+          </button>
+        </div>
+
+        <div className="savecode-divider"></div>
+
+        <div className="savecode-row">
+          <div className="savecode-label">RESTORE CODE</div>
+          <input
+            type="text"
+            className="hud-input savecode-input"
+            placeholder="Paste / type a numeric code to restore"
+            value={restoreCodeInput}
+            onChange={(e) => onRestoreCodeInput(e.target.value)}
+          />
+        </div>
+
+        <div className="savecode-actions">
+          <button type="button" className="hud-btn primary small" onClick={onRestore} disabled={!restoreCodeInput.trim()}>
+            RESTORE
+          </button>
+        </div>
+
+        {restoreStatus && <div className="savecode-status">{restoreStatus}</div>}
+        <div className="savecode-note">
+          Tip: This is device-local progress. It will not auto-sync to other devices unless you restore the same code.
+        </div>
+      </div>
+
+      <div className="grid" style={{ marginTop: "15px" }}>
         {specialties.map((spec) => (
           <button key={spec} className="game-card-btn" onClick={() => onSelect(spec)}>
             <div className="card-deco"></div>
             <div className="card-content">
               <div className="card-title">{spec.toUpperCase()}</div>
-              <div className="card-subtitle">5 MODULES AVAILABLE</div>
+              <div className="card-subtitle">MODULES AVAILABLE</div>
             </div>
           </button>
         ))}
@@ -699,9 +821,7 @@ function LevelScreen({ specialty, levels, loading, onBack, onSelectLevel, progre
           &lt; BACK
         </button>
         <div>
-          <h2 className="screen-title">
-            SECTOR: {specialty ? specialty.toUpperCase() : "UNKNOWN"}
-          </h2>
+          <h2 className="screen-title">SECTOR: {specialty ? specialty.toUpperCase() : "UNKNOWN"}</h2>
           <p className="screen-subtitle">Select simulation difficulty.</p>
         </div>
       </div>
@@ -801,8 +921,7 @@ function ChatScreen({
           <div className="objectives-header">
             <span>CASE OBJECTIVES</span>
             <span className="objective-helper">
-              Reveals: {revealsUsed}/{MAX_REVEALS_PER_LEVEL} · Stars left:{" "}
-              {starsLeftThisLevel}
+              Reveals: {revealsUsed}/{MAX_REVEALS_PER_LEVEL} · Stars left: {starsLeftThisLevel}
             </span>
           </div>
           <div className="objective-pill-row">
@@ -814,25 +933,17 @@ function ChatScreen({
                 if (obj.revealed_by_user) cls += " revealed";
                 return (
                   <div key={obj.id} className={cls}>
-                    <span className="objective-type">
-                      {obj.type === "diagnosis" ? "DX" : "TX"}
-                    </span>
-                    <span className="objective-label">
-                      {obj.visible ? obj.label : "????"}
-                    </span>
+                    <span className="objective-type">{obj.type === "diagnosis" ? "DX" : "TX"}</span>
+                    <span className="objective-label">{obj.visible ? obj.label : "????"}</span>
                   </div>
                 );
               })
             ) : (
-              <span className="objective-helper">
-                Objectives will light up as you discover them.
-              </span>
+              <span className="objective-helper">Objectives will light up as you discover them.</span>
             )}
           </div>
           <div className="objective-meta">
-            <span className="chip">
-              PLAN: clarify → risk factors → diagnose → treat
-            </span>
+            <span className="chip">PLAN: clarify → risk factors → diagnose → treat</span>
           </div>
         </div>
 
@@ -845,9 +956,7 @@ function ChatScreen({
 
         <div className="chat-window">
           <div className="chat-messages-container">
-            {messages.length === 0 && (
-              <div className="chat-empty">AWAITING INPUT...</div>
-            )}
+            {messages.length === 0 && <div className="chat-empty">AWAITING INPUT...</div>}
             {messages.map((m, idx) => (
               <MessageBubble key={idx} role={m.role} content={m.content} />
             ))}
@@ -863,32 +972,20 @@ function ChatScreen({
             value={input}
             onChange={(e) => onInputChange(e.target.value)}
           />
-          <button
-            type="submit"
-            className="hud-btn primary"
-            disabled={loading || !input.trim()}
-          >
+          <button type="submit" className="hud-btn primary" disabled={loading || !input.trim()}>
             TRANSMIT
           </button>
         </form>
 
         <div className="chat-actions">
-          <button
-            className="hud-btn secondary"
-            onClick={onHint}
-            disabled={hintLoading || missionComplete}
-          >
+          <button className="hud-btn secondary" onClick={onHint} disabled={hintLoading || missionComplete}>
             {hintLoading ? "SCANNING..." : "INTEL HINT"}
           </button>
+
           <button
             className="hud-btn secondary"
             onClick={onReveal}
-            disabled={
-              revealLoading ||
-              missionComplete ||
-              starsLeftThisLevel <= 0 ||
-              !hasHiddenObjectives
-            }
+            disabled={revealLoading || missionComplete || starsLeftThisLevel <= 0 || !hasHiddenObjectives}
           >
             {revealLoading
               ? "REVEALING..."
@@ -898,11 +995,8 @@ function ChatScreen({
               ? "NO OBJECTIVES LEFT"
               : "REVEAL OBJ (-1★)"}
           </button>
-          <button
-            className="hud-btn alert"
-            onClick={onSummary}
-            disabled={summaryLoading}
-          >
+
+          <button className="hud-btn alert" onClick={onSummary} disabled={summaryLoading}>
             {summaryLoading ? "ANALYZING..." : "END MISSION"}
           </button>
         </div>
@@ -1015,7 +1109,7 @@ function BootScreen({ stage, message, onRetry }) {
       : stage === "error"
       ? "OFFLINE – BACKEND UNREACHABLE"
       : stage === "syncing"
-      ? "SYNCING CAMPAIGN PROGRESS..."
+      ? "LOADING LOCAL PROGRESS + MISSION MAP..."
       : "CONNECTING TO BACKEND...";
 
   return (
@@ -1025,21 +1119,15 @@ function BootScreen({ stage, message, onRetry }) {
         <div className="boot-status-line">{statusText}</div>
 
         <div className="boot-log">
-          <div className="boot-step">
-            [1/3] Connect to backend ({API_BASE})
-          </div>
-          <div className="boot-step">[2/3] Sync campaign progress</div>
-          <div className="boot-step">[3/3] Load specialty sectors UI</div>
+          <div className="boot-step">[1/3] Connect to backend ({API_BASE})</div>
+          <div className="boot-step">[2/3] Load mission map</div>
+          <div className="boot-step">[3/3] Load local campaign progress</div>
         </div>
 
         <pre className="boot-message">{message}</pre>
 
         {isError && onRetry && (
-          <button
-            type="button"
-            className="hud-btn alert small"
-            onClick={onRetry}
-          >
+          <button type="button" className="hud-btn alert small" onClick={onRetry}>
             RETRY CONNECTION
           </button>
         )}
